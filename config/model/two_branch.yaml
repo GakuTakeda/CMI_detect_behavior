@@ -1,0 +1,7 @@
+name: two_branch
+imu_ch: null            # ← train.py 側で自動計算
+tof_ch: null
+
+conv_ch: 64
+lstm_units: 128
+classes: null           # 自動計算
