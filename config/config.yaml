@@ -1,4 +1,25 @@
+# conf/config.yaml
 defaults:
-  - data: cmi
-  - model: two_branch
-  - train: default
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+param:
+  raw_dir: data                       # 入力 CSV が入っているディレクトリ
+  export_dir: output                  # 結果を出力するディレクトリ
+  train_csv: "train.csv"              # 学習データのファイル名
+
+  # シーケンス前処理関連
+  pad_percentile: 95                  # padding length を決めるパーセンタイル
+  batch_size: 64
+  lr_init: 1e-3
+  wd: 1e-5
+  mixup_alpha: 0.4
+  epochs: 160
+  patience: 20
+
+  # 5-fold の分割数
+  n_splits: 5
+
+  # その他（必要であれば追加）
+  random_seed: 42
+
