@@ -149,6 +149,62 @@ class ResidualSEBlock(nn.Module):
         out = self.pool(out)
         out = self.drop(out)
         return out                           # (N, C_out, L')
+class EnhancedSEBlock(nn.Module):
+    """
+    An enhanced Squeeze-and-Excitation block that uses both average and max pooling,
+    inspired by the reference implementation.
+    """
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels * 2, channels // reduction, bias=False),
+            nn.SiLU(inplace=True),  # Using SiLU (swish) as in TF reference
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        b, c, _ = x.size()
+        avg_y = self.avg_pool(x).view(b, c)
+        max_y = self.max_pool(x).view(b, c)
+        y = torch.cat([avg_y, max_y], dim=1)
+        y = self.excitation(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+class MultiScaleConv1d(nn.Module):
+    """Multi-scale temporal convolution block"""
+    def __init__(self, in_channels, out_channels, kernel_sizes=[3, 5, 7]):
+        super().__init__()
+        self.convs = nn.ModuleList()
+        for ks in kernel_sizes:
+            self.convs.append(nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, ks, padding=ks//2, bias=False),
+                nn.BatchNorm1d(out_channels),
+                nn.ReLU(inplace=True)
+            ))
+        
+    def forward(self, x):
+        outputs = [conv(x) for conv in self.convs]
+        return torch.cat(outputs, dim=1)
+class MetaFeatureExtractor(nn.Module):
+    """Extract statistical meta-features from input sequence"""
+    def forward(self, x):
+        # x shape: (B, L, C)
+        mean = torch.mean(x, dim=1)
+        std = torch.std(x, dim=1)
+        max_val, _ = torch.max(x, dim=1)
+        min_val, _ = torch.min(x, dim=1)
+        
+        # Calculate slope: (last - first) / seq_len
+        seq_len = x.size(1)
+        if seq_len > 1:
+            slope = (x[:, -1, :] - x[:, 0, :]) / (seq_len - 1)
+        else:
+            slope = torch.zeros_like(x[:, 0, :])
+        
+        return torch.cat([mean, std, max_val, min_val, slope], dim=1)
 
 class AttentionLayer(nn.Module):
     """
@@ -286,3 +342,89 @@ class TwoBranchModel(nn.Module):
         imu, tof = torch.split(x, [self.imu_ch, self.tof_ch], dim=-1)
         h = torch.cat([self.branch_imu(imu), self.branch_tof(tof)], dim=1)
         return self.fc(h)
+    
+class ModelVariant_GRU(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        num_channels = 7  # Hardcoded for IMU data
+
+        # 1. 
+        self.meta_extractor = MetaFeatureExtractor()
+        self.meta_dense = nn.Sequential(
+            nn.Linear(5 * num_channels, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+
+        # 2. 
+        self.branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    # 输出通道数减少，从16*3=48 -> 12*3=36
+                    MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
+                    # 输出通道数相应调整
+                    ResidualSEBlock(36, 48, 3, drop=0.3),
+                    ResidualSEBlock(48, 48, 3, drop=0.3),
+                )
+                for _ in range(num_channels)
+            ]
+        )
+
+        # 3. 序列核心：使用BiGRU替换BiLSTM，并移除MultiHeadAttention
+        self.bigru = nn.GRU(
+            input_size=48 * num_channels,
+            hidden_size=128,  # 保持hidden_size
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2,
+        )
+
+        # 4. Attention Pooling层保持不变
+        self.attention_pooling = AttentionLayer(256)  # 128 * 2 for bidirectional
+
+        # 5. 
+        self.head_1 = nn.Sequential(
+            nn.Linear(256 + 32, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes),
+        )
+
+        self.head_2 = nn.Sequential(
+            nn.Linear(256 + 32, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 1),  # For regression task
+        )
+
+    def forward(self, x: torch.Tensor):
+        # Meta features
+        meta = self.meta_extractor(x)
+        meta_proj = self.meta_dense(meta)
+
+        # CNN branches
+        branch_outputs = []
+        for i in range(x.shape[2]):
+            channel_input = x[:, :, i].unsqueeze(1)
+            processed = self.branches[i](channel_input)
+            branch_outputs.append(processed.transpose(1, 2))
+
+        combined = torch.cat(branch_outputs, dim=2)
+
+        # BiGRU processing
+        gru_out, _ = self.bigru(combined)  # (B, L/k, 256)
+
+        # Attention pooling
+        pooled_output = self.attention_pooling(gru_out)  # (B, 256)
+
+        # Combine with meta features
+        fused = torch.cat([pooled_output, meta_proj], dim=1)
+
+        # Final predictions
+        z1 = self.head_1(fused)
+        z2 = self.head_2(fused)
+        return z1, z2
