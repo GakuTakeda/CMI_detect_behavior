@@ -20,9 +20,7 @@ class LitGestureClassifier(L.LightningModule):
             self.model = ModelVariant_GRU(num_classes=9)
         else:
             self.model = TwoBranchModel(
-                imu_ch, tof_ch, num_classes,
-                conv_ch   = conv_ch,
-                lstm_units= lstm_units,
+                imu_ch, tof_ch, num_classes
             )
 
         self.save_hyperparameters()   

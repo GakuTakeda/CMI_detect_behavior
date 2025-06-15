@@ -299,50 +299,82 @@ def mixup_collate_fn(alpha: float = 0.2):
 
     return _collate
 
-class Branch(nn.Module):
-    """Conv → SE ResBlocks → BiLSTM → Attention"""
-    def __init__(self, in_ch, conv_ch=64, lstm_units=128):
+class GaussianNoise(nn.Module):
+    def __init__(self, stddev=0.1):
         super().__init__()
-        self.block1 = ResidualSEBlock(in_ch,   conv_ch, k=5)
-        self.block2 = ResidualSEBlock(conv_ch, conv_ch*2, k=3)
-        self.bilstm = nn.LSTM(
-            input_size=conv_ch*2, hidden_size=lstm_units,
-            batch_first=True, bidirectional=True
-        )
-        self.att = AttentionLayer(2*lstm_units)
-        self.out_dim = 2*lstm_units
-    def forward(self, x):                 # x:(N, L, C)
-        x = x.transpose(1,2)              # →(N,C,L)
-        x = self.block1(x)
-        x = self.block2(x).transpose(1,2) # →(N,L',C)
-        x,_ = self.bilstm(x)
-        return self.att(x)                # (N, out_dim)
+        self.stddev = stddev
+
+    def forward(self, x):
+        if self.training and self.stddev > 0:
+            noise = torch.randn_like(x) * self.stddev
+            return x + noise
+        return x
 
 class TwoBranchModel(nn.Module):
-    def __init__(
-        self,
-        imu_ch: int,
-        tof_ch: int,
-        n_classes: int,
-        conv_ch: int = 64,        # ★ 追加：デフォルト値を設けても良い
-        lstm_units: int = 128     # ★ 追加
-    ):
+    def __init__(self, imu_dim, tof_dim, n_classes):
         super().__init__()
-        self.imu_ch = imu_ch
-        self.tof_ch = tof_ch
+        self.imu_dim = imu_dim
+        self.tof_dim = tof_dim
 
-        # ── 2 つのブランチ ─────────────────────────
-        self.branch_imu = Branch(imu_ch, conv_ch=conv_ch, lstm_units=lstm_units)
-        self.branch_tof = Branch(tof_ch, conv_ch=conv_ch, lstm_units=lstm_units)
+        # IMU branch
+        self.imu_branch = nn.Sequential(
+            ResidualSEBlock(imu_dim, 64, 3, drop=0.1),
+            ResidualSEBlock(64, 128, 5, drop=0.1)
+        )
 
-        merged_dim = self.branch_imu.out_dim + self.branch_tof.out_dim
-        self.fc = nn.Linear(merged_dim, n_classes)
+        # TOF branch
+        self.tof_branch = nn.Sequential(
+            nn.Conv1d(tof_dim, 64, 3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.2),
+            nn.Conv1d(64, 128, 3, padding=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(0.2)
+        )
 
-    def forward(self, x):                           # x: (N, L, C_total)
-        imu, tof = torch.split(x, [self.imu_ch, self.tof_ch], dim=-1)
-        h = torch.cat([self.branch_imu(imu), self.branch_tof(tof)], dim=1)
-        return self.fc(h)
-    
+        # RNN & Dense branches
+        self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
+        self.gru = nn.GRU(input_size=256, hidden_size=128, batch_first=True, bidirectional=True)
+        self.noise = GaussianNoise(0.09)
+        self.fc_noise = nn.Linear(256, 16)
+        self.attn = AttentionLayer(128*2 + 128*2 + 16)
+
+        self.fc = nn.Sequential(
+            nn.Linear(128*4 + 16, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, n_classes)
+        )
+
+    def forward(self, x):
+        # x: (B, T, D) where D = imu_dim + tof_dim
+        imu = x[:, :, :self.imu_dim].permute(0, 2, 1)  # (B, C, T)
+        tof = x[:, :, self.imu_dim:].permute(0, 2, 1)
+
+        x1 = self.imu_branch(imu)  # (B, C, T)
+        x2 = self.tof_branch(tof)  # (B, C, T)
+
+        merged = torch.cat([x1, x2], dim=1).permute(0, 2, 1)  # → (B, T, D_merged)
+
+        xa, _ = self.lstm(merged)
+        xb, _ = self.gru(merged)
+
+        xc = self.noise(merged)
+        xc = F.elu(self.fc_noise(xc))
+
+        x = torch.cat([xa, xb, xc], dim=2)
+        x = self.attn(x)
+        return self.fc(x)
+
 class ModelVariant_GRU(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
