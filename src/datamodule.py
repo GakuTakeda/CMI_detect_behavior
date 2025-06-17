@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
-from utils import preprocess_sequence, SequenceDataset, mixup_collate_fn
+from utils import preprocess_sequence, SequenceDataset, mixup_collate_fn, feature_eng
 from sklearn.utils.class_weight import compute_class_weight
 from hydra.core.hydra_config import HydraConfig
 import math
@@ -27,6 +27,7 @@ class GestureDataModule(L.LightningDataModule):
     # prepare_data は最初の fold だけ呼ばれれば OK
     def prepare_data(self):
         df = pd.read_csv(self.raw_dir / "train.csv")
+        df = feature_eng(df)
         le = LabelEncoder(); df["gesture_int"] = le.fit_transform(df["gesture"])
         self.export_dir.mkdir(parents=True, exist_ok=True)
         np.save(self.export_dir/"gesture_classes.npy", le.classes_)
@@ -44,11 +45,14 @@ class GestureDataModule(L.LightningDataModule):
     # fold ごとに train / val を切り分け
     def setup(self, stage="fit"):
         df = pd.read_csv(self.raw_dir / "train.csv")
+        df = feature_eng(df)
+        meta = {'gesture','gesture_int','sequence_type','behavior','orientation',
+                'row_id','subject','phase','sequence_id','sequence_counter'}
+
         le = LabelEncoder(); df["gesture_int"] = le.fit_transform(df["gesture"])
         self.num_classes = len(le.classes_)
 
-        meta = {'gesture','gesture_int','sequence_type','behavior','orientation',
-                'row_id','subject','phase','sequence_id','sequence_counter'}
+
         self.feat_cols = [c for c in df.columns if c not in meta]
 
         imu_cols = [c for c in self.feat_cols

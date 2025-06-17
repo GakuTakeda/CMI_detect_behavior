@@ -9,6 +9,28 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data.dataloader import default_collate
 
+def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
+    df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+    df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1, 1))
+    df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
+    df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
+
+    insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel']
+    cols = list(df.columns)
+
+    for i, col in enumerate(cols):
+        if col.startswith('thm_') or col.startswith('tof_'):
+            insert_index = i
+            break
+
+    cols_wo_insert = [c for c in cols if c not in insert_cols]
+
+    new_order = cols_wo_insert[:insert_index] + insert_cols + cols_wo_insert[insert_index:]
+    df = df[new_order]
+
+    return df
+
+
 class TimeseriesDataset(Dataset):
     def __init__(self, X, y):
         self.X = torch.as_tensor(X, dtype=torch.float32)   # shape: (N, L, C)
@@ -378,7 +400,7 @@ class TwoBranchModel(nn.Module):
 class ModelVariant_GRU(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        num_channels = 7  # Hardcoded for IMU data
+        num_channels = 11  # Hardcoded for IMU data
 
         # 1. 
         self.meta_extractor = MetaFeatureExtractor()
