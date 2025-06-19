@@ -8,12 +8,79 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data.dataloader import default_collate
+from scipy.spatial.transform import Rotation as R
+
+def remove_outliers(df: pd.DataFrame, threshold: int = 300) -> pd.DataFrame:
+    df = df.copy()
+    df_out = df.copy()
+    tof_thm_cols = [c for c in df.columns if c.startswith("thm") or c.startswith("tof")]
+    by_seq = (
+        df[tof_thm_cols].eq(-1)      # == -1 と同じ
+        .groupby(df['sequence_id'])  # sequence_id ごと
+        .sum()                      # 列ごとの個数
+    )
+    null_id = []
+    for i in range(by_seq.shape[0]):
+        if by_seq.iloc[i].sum()/df.loc[df['sequence_id'] == by_seq.index[i], 'sequence_id'].count() > threshold:
+            null_id.append(by_seq.index[i])
+    return null_id
+
+def remove_gravity_from_acc(acc_data, rot_data):
+
+
+    if isinstance(acc_data, pd.DataFrame):
+        acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values
+    else:
+        acc_values = acc_data
+
+    if isinstance(rot_data, pd.DataFrame):
+        quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+    else:
+        quat_values = rot_data
+
+    num_samples = acc_values.shape[0]
+    linear_accel = np.zeros_like(acc_values)
+    
+    gravity_world = np.array([0, 0, 9.81])
+
+    for i in range(num_samples):
+        if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
+            linear_accel[i, :] = acc_values[i, :] 
+            continue
+
+        try:
+            rotation = R.from_quat(quat_values[i])
+            gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
+            linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
+        except ValueError:
+             linear_accel[i, :] = acc_values[i, :]
+             
+    return linear_accel
+
+def remove_gravity_from_acc_in_train(df: pd.DataFrame) -> pd.DataFrame:
+    acc_cols = [c for c in df.columns if c.startswith('acc_')]
+    rot_cols = [c for c in df.columns if c.startswith('rot_')]
+    # 出力用の空配列を準備（順序を保つ）
+    linear_acc_all = np.zeros((len(df), 3), dtype=np.float32)
+    
+    for _, seq in df.groupby('sequence_id'):
+        idx = seq.index                     # 元の行番号を保存
+        linear_acc = remove_gravity_from_acc(seq[acc_cols], seq[rot_cols])
+        linear_acc_all[idx, :] = linear_acc  # 元の位置に代入
+    
+    # 新しい列として DataFrame に追加
+    df[['linear_acc_x', 'linear_acc_y', 'linear_acc_z']] = linear_acc_all
+    return df
+
 
 def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
+    # df = remove_gravity_from_acc_in_train(df)
     df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
     df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1, 1))
     df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
     df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
+    # df['linear_acc_mag'] = np.sqrt(df['linear_acc_x']**2 + df['linear_acc_y']**2 + df['linear_acc_z']**2)
+    # df['linear_acc_mag_jerk'] = df.groupby('sequence_id')['linear_acc_mag'].diff().fillna(0)
 
     insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel']
     cols = list(df.columns)
@@ -397,12 +464,15 @@ class TwoBranchModel(nn.Module):
         x = self.attn(x)
         return self.fc(x)
 
-class ModelVariant_GRU(nn.Module):
-    def __init__(self, num_classes):
+class ModelVariant_LSTMGRU(nn.Module):
+    """
+    IMU 専用：CNN → BiGRU ＆ BiLSTM → AttentionPooling → 2 ヘッド
+    """
+    def __init__(self, num_classes: int):
         super().__init__()
-        num_channels = 11  # Hardcoded for IMU data
+        num_channels = 11  # IMU チャンネル数
 
-        # 1. 
+        # 1. Meta features
         self.meta_extractor = MetaFeatureExtractor()
         self.meta_dense = nn.Sequential(
             nn.Linear(5 * num_channels, 32),
@@ -411,36 +481,43 @@ class ModelVariant_GRU(nn.Module):
             nn.Dropout(0.2),
         )
 
-        # 2. 
-        self.branches = nn.ModuleList(
-            [
-                nn.Sequential(
-                    # 输出通道数减少，从16*3=48 -> 12*3=36
-                    MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
-                    # 输出通道数相应调整
-                    ResidualSEBlock(36, 48, 3, drop=0.3),
-                    ResidualSEBlock(48, 48, 3, drop=0.3),
-                )
-                for _ in range(num_channels)
-            ]
-        )
+        # 2. Per-channel CNN branches
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
+                ResidualSEBlock(36, 48, 3, drop=0.3),
+                ResidualSEBlock(48, 48, 3, drop=0.3),
+            )
+            for _ in range(num_channels)
+        ])
 
-        # 3. 序列核心：使用BiGRU替换BiLSTM，并移除MultiHeadAttention
+        # 3-a. BiGRU
         self.bigru = nn.GRU(
             input_size=48 * num_channels,
-            hidden_size=128,  # 保持hidden_size
+            hidden_size=128,
             num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=0.2,
         )
 
-        # 4. Attention Pooling层保持不变
-        self.attention_pooling = AttentionLayer(256)  # 128 * 2 for bidirectional
+        # 3-b. **BiLSTM を追加**
+        self.bilstm = nn.LSTM(
+            input_size=48 * num_channels,
+            hidden_size=128,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.2,
+        )
 
-        # 5. 
+        # 4. Attention Pooling (GRU 256 + LSTM 256 = 512)
+        self.attention_pooling = AttentionLayer(512)
+
+        # 5. Prediction heads
+        in_feat = 512 + 32  # pooled + meta
         self.head_1 = nn.Sequential(
-            nn.Linear(256 + 32, 512),
+            nn.Linear(in_feat, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
@@ -448,37 +525,41 @@ class ModelVariant_GRU(nn.Module):
         )
 
         self.head_2 = nn.Sequential(
-            nn.Linear(256 + 32, 512),
+            nn.Linear(in_feat, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512, 1),  # For regression task
+            nn.Linear(512, 1),   # regression
         )
 
     def forward(self, x: torch.Tensor):
-        # Meta features
-        meta = self.meta_extractor(x)
-        meta_proj = self.meta_dense(meta)
+        """
+        x: (B, L, C)  – L=系列長, C=16ch
+        """
+        # ---------- meta ----------
+        meta = self.meta_extractor(x)              # (B, 5*C)
+        meta_proj = self.meta_dense(meta)          # (B, 32)
 
-        # CNN branches
-        branch_outputs = []
-        for i in range(x.shape[2]):
-            channel_input = x[:, :, i].unsqueeze(1)
-            processed = self.branches[i](channel_input)
-            branch_outputs.append(processed.transpose(1, 2))
+        # ---------- CNN branches ----------
+        branch_outs = []
+        for i in range(x.shape[2]):                # each channel
+            ci = x[:, :, i].unsqueeze(1)           # (B,1,L)
+            out = self.branches[i](ci)             # (B,48,L')
+            branch_outs.append(out.transpose(1, 2))  # → (B,L',48)
 
-        combined = torch.cat(branch_outputs, dim=2)
+        combined = torch.cat(branch_outs, dim=2)   # (B,L',48*C)
 
-        # BiGRU processing
-        gru_out, _ = self.bigru(combined)  # (B, L/k, 256)
+        # ---------- RNN ----------
+        gru_out, _  = self.bigru(combined)         # (B,L',256)
+        lstm_out, _ = self.bilstm(combined)        # (B,L',256)
 
-        # Attention pooling
-        pooled_output = self.attention_pooling(gru_out)  # (B, 256)
+        rnn_cat = torch.cat([gru_out, lstm_out], dim=2)  # (B,L',512)
 
-        # Combine with meta features
-        fused = torch.cat([pooled_output, meta_proj], dim=1)
+        # ---------- Attention pooling ----------
+        pooled = self.attention_pooling(rnn_cat)   # (B,512)
 
-        # Final predictions
-        z1 = self.head_1(fused)
-        z2 = self.head_2(fused)
-        return z1, z2
+        # ---------- Fuse & heads ----------
+        fused = torch.cat([pooled, meta_proj], dim=1)  # (B,544)
+        z_cls = self.head_1(fused)
+        z_reg = self.head_2(fused)
+        return z_cls, z_reg

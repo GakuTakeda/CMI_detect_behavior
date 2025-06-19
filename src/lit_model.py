@@ -1,7 +1,7 @@
 # src/lit_module.py
 import torch, lightning as L, numpy as np
 from sklearn.utils.class_weight import compute_class_weight
-from utils import TwoBranchModel, ModelVariant_GRU
+from utils import TwoBranchModel, ModelVariant_LSTMGRU
 from omegaconf import OmegaConf
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +17,7 @@ class LitGestureClassifier(L.LightningModule):
         super().__init__()
 
         if imu_only == True:
-            self.model = ModelVariant_GRU(num_classes=9)
+            self.model = ModelVariant_LSTMGRU(num_classes=9)
         else:
             self.model = TwoBranchModel(
                 imu_ch, tof_ch, num_classes
@@ -96,7 +96,7 @@ class LitModelVariantGRU(L.LightningModule):
         self.save_hyperparameters()
 
         # --- core model -----------------------------------------------------
-        self.model = ModelVariant_GRU(num_classes=num_classes)
+        self.model = ModelVariant_LSTMGRU(num_classes=num_classes)
 
         # 損失関数
         self.mse = nn.MSELoss()   # 回帰用
