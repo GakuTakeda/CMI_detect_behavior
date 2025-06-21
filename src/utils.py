@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data.dataloader import default_collate
 from scipy.spatial.transform import Rotation as R
+import copy
 
 def remove_outliers(df: pd.DataFrame, threshold: int = 300) -> pd.DataFrame:
     df = df.copy()
@@ -388,6 +389,70 @@ def mixup_collate_fn(alpha: float = 0.2):
 
     return _collate
 
+class ConformerBlock(nn.Module):
+    """Simplified 1-D Conformer block (FFN → MHSA → ConvModule → FFN)."""
+    def __init__(self,
+                 d_model: int = 256,
+                 n_heads: int = 4,
+                 ffn_expansion: int = 4,
+                 conv_kernel: int = 31,
+                 dropout: float = 0.1):
+        super().__init__()
+
+        # FFN (pre) ----------------------------------------------------------
+        self.ffn1 = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * ffn_expansion),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * ffn_expansion, d_model),
+            nn.Dropout(dropout),
+        )
+
+        # Self-attention ------------------------------------------------------
+        self.mhsa = nn.MultiheadAttention(d_model,
+                                          n_heads,
+                                          dropout=dropout,
+                                          batch_first=True)
+        self.ln_mhsa = nn.LayerNorm(d_model)
+
+        # Convolutional module -----------------------------------------------
+        self.conv = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Conv1d(d_model, 2 * d_model, kernel_size=1),
+            nn.GLU(dim=1),                                     # gate
+            nn.Conv1d(d_model,
+                      d_model,
+                      kernel_size=conv_kernel,
+                      padding=conv_kernel // 2,
+                      groups=d_model),
+            nn.BatchNorm1d(d_model),
+            nn.SiLU(),
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.Dropout(dropout),
+        )
+
+        # FFN (post) ---------------------------------------------------------
+        self.ffn2 = copy.deepcopy(self.ffn1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, d_model)
+        Returns:
+            (B, T, d_model)
+        """
+        # pre-FFN
+        x = x + 0.5 * self.ffn1(x)
+        # Self-attention
+        x = x + self.ln_mhsa(self.mhsa(x, x, x)[0])
+        # Conv module (LayerNorm inside)
+        xc = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        x = x + xc
+        # post-FFN
+        x = x + 0.5 * self.ffn2(x)
+        return x
+
 class GaussianNoise(nn.Module):
     def __init__(self, stddev=0.1):
         super().__init__()
@@ -511,11 +576,13 @@ class ModelVariant_LSTMGRU(nn.Module):
             dropout=0.2,
         )
 
+        self.noise = GaussianNoise(0.09)
+
         # 4. Attention Pooling (GRU 256 + LSTM 256 = 512)
-        self.attention_pooling = AttentionLayer(512)
+        self.attention_pooling = AttentionLayer(1040)
 
         # 5. Prediction heads
-        in_feat = 512 + 32  # pooled + meta
+        in_feat = 1040 + 32  # pooled + meta
         self.head_1 = nn.Sequential(
             nn.Linear(in_feat, 512),
             nn.BatchNorm1d(512),
@@ -552,8 +619,9 @@ class ModelVariant_LSTMGRU(nn.Module):
         # ---------- RNN ----------
         gru_out, _  = self.bigru(combined)         # (B,L',256)
         lstm_out, _ = self.bilstm(combined)        # (B,L',256)
+        noise_out = self.noise(combined)
 
-        rnn_cat = torch.cat([gru_out, lstm_out], dim=2)  # (B,L',512)
+        rnn_cat = torch.cat([gru_out, lstm_out, noise_out], dim=2)  # (B,L',512)
 
         # ---------- Attention pooling ----------
         pooled = self.attention_pooling(rnn_cat)   # (B,512)
@@ -562,4 +630,110 @@ class ModelVariant_LSTMGRU(nn.Module):
         fused = torch.cat([pooled, meta_proj], dim=1)  # (B,544)
         z_cls = self.head_1(fused)
         z_reg = self.head_2(fused)
+        return z_cls, z_reg
+
+# ---------- Main Model ----------
+class ModelVariant_Conf(nn.Module):
+    """
+    IMU 専用:
+      ▸ Per-channel CNN
+      ▸ BiGRU ＆ BiLSTM ＆ Conformer (並列)
+      ▸ AttentionPooling
+      ▸ 2-Head (分類 + 回帰)
+    """
+    def __init__(self,
+                 num_classes: int,
+                 num_channels: int = 11):
+        super().__init__()
+
+        # 1. Meta features ----------------------------------------------------
+        self.meta_extractor = MetaFeatureExtractor()          # (B, 5*C)
+        self.meta_dense = nn.Sequential(
+            nn.Linear(5 * num_channels, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+        )
+
+        # 2. Per-channel CNN --------------------------------------------------
+        self.branches = nn.ModuleList([
+            nn.Sequential(
+                MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
+                ResidualSEBlock(36, 48, 3, drop=0.3),
+                ResidualSEBlock(48, 48, 3, drop=0.3),
+            )
+            for _ in range(num_channels)
+        ])
+
+        proj_dim = 48 * num_channels      # 48 per-channel × #channels                         # → (B, L', 256)
+
+        # 3-c. Conformer ------------------------------------------------------
+        d_model = 256
+        self.in_proj = nn.Linear(proj_dim, d_model)
+        self.conformer = nn.Sequential(
+            ConformerBlock(d_model=d_model, n_heads=4),
+            ConformerBlock(d_model=d_model, n_heads=4),
+        )                                  # → (B, L', 256)
+
+        # 4. Attention pooling -----------------------------------------------
+        rnn_feat_dim = 256 + 256 + 256     # GRU + LSTM + Conformer
+        self.attention_pooling = AttentionLayer(rnn_feat_dim)  # (B, 768)
+
+        # 5. Prediction heads -------------------------------------------------
+        in_feat = rnn_feat_dim + 32
+        self.head_1 = nn.Sequential(
+            nn.Linear(in_feat, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes),
+        )
+        self.head_2 = nn.Sequential(
+            nn.Linear(in_feat, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 1),
+        )
+
+    # --------------------------------------------------------------------- #
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: (B, L, C)   - L: 時系列長, C: IMU チャンネル数
+        Returns:
+            z_cls: (B, num_classes)
+            z_reg: (B, 1)
+        """
+        B, L, C = x.shape
+
+        # ===== Meta features =====
+        meta = self.meta_extractor(x)          # (B, 5*C)
+        meta_proj = self.meta_dense(meta)      # (B, 32)
+
+        # ===== CNN branches per channel =====
+        branch_outs = []
+        for i in range(C):
+            ci = x[:, :, i].unsqueeze(1)       # (B, 1, L)
+            out_i = self.branches[i](ci)       # (B, 48, L')
+            branch_outs.append(out_i.transpose(1, 2))  # → (B, L', 48)
+
+        combined = torch.cat(branch_outs, dim=2)       # (B, L', 48*C)
+
+        # ===== BiGRU & BiLSTM =====
+        gru_out, _  = self.bigru(combined)     # (B, L', 256)
+        lstm_out, _ = self.bilstm(combined)    # (B, L', 256)
+
+        # ===== Conformer =====
+        conf_in = self.in_proj(combined)       # (B, L', 256)
+        conf_out = self.conformer(conf_in)     # (B, L', 256)
+
+        # ===== Concat & Attention pooling =====
+        feat_cat = torch.cat([gru_out, lstm_out, conf_out], dim=2)  # (B, L', 768)
+        pooled = self.attention_pooling(feat_cat)                   # (B, 768)
+
+        # ===== Heads =====
+        fused = torch.cat([pooled, meta_proj], dim=1)   # (B, 800)
+        z_cls = self.head_1(fused)                     # (B, num_classes)
+        z_reg = self.head_2(fused)                     # (B, 1)
         return z_cls, z_reg
