@@ -2,12 +2,13 @@
 import hydra, lightning as L
 from omegaconf import DictConfig
 from datamodule import GestureDataModule
-from lit_model     import LitGestureClassifier, LitModelVariantGRU
+from lit_model     import LitGestureClassifier, LitModelVariantGRU, LitModelVariantConf
 import json
 import os
 import torch
 import numpy as np
 from CMI_2025 import score
+from lightning.pytorch.loggers import TensorBoardLogger
 
 @hydra.main(config_path="../config", config_name="config", version_base="1.3")
 def run(cfg: DictConfig):
@@ -25,7 +26,7 @@ def run(cfg: DictConfig):
                                      dm.num_classes,
                                      class_weight=dm.class_weight,
                                      steps_per_epoch=dm.steps_per_epoch)
-        imu_model = LitModelVariantGRU(
+        imu_model = LitModelVariantConf(
             num_classes=dm.num_classes,
             lr_init=cfg.train.lr_init,
             weight_decay=cfg.train.weight_decay,
@@ -54,10 +55,16 @@ def run(cfg: DictConfig):
             log_every_n_steps = 50,
         )
         print("start training")
-        trainer.fit(model=model, train_dataloaders=dm.train_dataloader(), val_dataloaders=dm.val_dataloader())
+
+        tb_logger = TensorBoardLogger(
+            save_dir=os.path.join(dm.export_dir, "lightning_logs"),   # ここにサブフォルダを自動生成
+            name=f"imu_{fold+1}",                  # → lightning_logs/imu/version_0/
+        )
+
         trainer = L.Trainer(
             max_epochs      = cfg.train.epochs,
             accelerator     = cfg.train.device,
+            logger          = tb_logger, 
             callbacks = [
                 L.pytorch.callbacks.EarlyStopping(
                     monitor="val/loss",
@@ -80,17 +87,8 @@ def run(cfg: DictConfig):
             allow_pickle=True
         )
         with torch.no_grad():
-            model = LitGestureClassifier.load_from_checkpoint(
-                    checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_{fold+1}.ckpt"),
-                    cfg          = 0,
-                    imu_ch       = 11,
-                    tof_ch       = 325,
-                    num_classes  = 18,
-                )
-            model.eval()
-            model.to(cfg.train.device)
 
-            imu_model = LitModelVariantGRU.load_from_checkpoint(
+            imu_model = LitModelVariantConf.load_from_checkpoint(
                     checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_imu_{fold+1}.ckpt"),
                     num_classes=18,
                     lr_init=cfg.train.lr_init,
@@ -100,9 +98,7 @@ def run(cfg: DictConfig):
             imu_model.eval()
             imu_model.to(cfg.train.device)
 
-            submission = []
             submission_imu = []
-            solution = []
             solution_imu = []
             for (batch, batch_imu) in zip(dm.val_dataloader(), dm.val_dataloader_imu()):
 
@@ -111,23 +107,16 @@ def run(cfg: DictConfig):
                 x = x.to(cfg.train.device, non_blocking=True)
                 x_imu = x_imu.to(cfg.train.device, non_blocking=True)
 
-                y_pred = model(x)
                 y_pred_imu_1, y_pred_imu_2 = imu_model(x_imu)
 
-                for pred, pred_imu_1 in zip(y_pred, y_pred_imu_1):
-                    idx   = pred.argmax(dim=0).cpu().numpy()
+                for pred_imu_1 in y_pred_imu_1:
                     idx_imu_1 = pred_imu_1.argmax(dim=0).cpu().numpy()
-                    submission.append(str(gesture_classes[idx]))
                     submission_imu.append(str(gesture_classes[idx_imu_1]))
-
                 for y_true, y_true_imu in zip(y, y_imu):
-                    idx   = y_true.argmax(dim=0).cpu().numpy()
                     idx_imu_1 = y_true_imu.argmax(dim=0).cpu().numpy()
-                    solution.append(str(gesture_classes[idx]))
                     solution_imu.append(str(gesture_classes[idx_imu_1]))
 
             scores = {
-                f"score_of_fold_{fold+1}":      score(solution,       submission),
                 f"score_of_fold_{fold+1}_imu":  score(solution_imu,   submission_imu),
             }
 

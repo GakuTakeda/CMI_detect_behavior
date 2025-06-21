@@ -389,17 +389,36 @@ def mixup_collate_fn(alpha: float = 0.2):
 
     return _collate
 
-class ConformerBlock(nn.Module):
-    """Simplified 1-D Conformer block (FFN → MHSA → ConvModule → FFN)."""
-    def __init__(self,
-                 d_model: int = 256,
-                 n_heads: int = 4,
-                 ffn_expansion: int = 4,
-                 conv_kernel: int = 31,
-                 dropout: float = 0.1):
+class ConvModule1D(nn.Module):
+    def __init__(self, d_model: int, conv_kernel: int = 31, dropout: float = 0.1):
         super().__init__()
+        self.ln   = nn.LayerNorm(d_model)
+        self.pw1  = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
+        self.dw   = nn.Conv1d(d_model, d_model, kernel_size=conv_kernel,
+                              padding=conv_kernel // 2, groups=d_model)
+        self.bn   = nn.BatchNorm1d(d_model)
+        self.act  = nn.SiLU()
+        self.pw2  = nn.Conv1d(d_model, d_model, kernel_size=1)
+        self.drop = nn.Dropout(dropout)
 
-        # FFN (pre) ----------------------------------------------------------
+    def forward(self, x):                 # x: (B, T, D)
+        x = self.ln(x)                    # (B, T, D)
+        x = x.transpose(1, 2)             # (B, D, T)
+        x = self.pw1(x)                   # (B, 2D, T)
+        x = F.glu(x, dim=1)               # (B, D, T)
+        x = self.dw(x)                    # (B, D, T)
+        x = self.bn(x)
+        x = self.act(x)
+        x = self.pw2(x)                   # (B, D, T)
+        x = self.drop(x)
+        return x.transpose(1, 2)          # (B, T, D) に戻す
+
+
+class ConformerBlock(nn.Module):
+    """FFN → MHSA → ConvModule → FFN（各残差に 0.5 係数）"""
+    def __init__(self, d_model=256, n_heads=4,
+                 ffn_expansion=4, conv_kernel=31, dropout=0.1):
+        super().__init__()
         self.ffn1 = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model * ffn_expansion),
@@ -408,48 +427,16 @@ class ConformerBlock(nn.Module):
             nn.Linear(d_model * ffn_expansion, d_model),
             nn.Dropout(dropout),
         )
+        self.mhsa     = nn.MultiheadAttention(d_model, n_heads,
+                                              dropout=dropout, batch_first=True)
+        self.ln_mhsa  = nn.LayerNorm(d_model)
+        self.conv_mod = ConvModule1D(d_model, conv_kernel, dropout)
+        self.ffn2     = copy.deepcopy(self.ffn1)
 
-        # Self-attention ------------------------------------------------------
-        self.mhsa = nn.MultiheadAttention(d_model,
-                                          n_heads,
-                                          dropout=dropout,
-                                          batch_first=True)
-        self.ln_mhsa = nn.LayerNorm(d_model)
-
-        # Convolutional module -----------------------------------------------
-        self.conv = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Conv1d(d_model, 2 * d_model, kernel_size=1),
-            nn.GLU(dim=1),                                     # gate
-            nn.Conv1d(d_model,
-                      d_model,
-                      kernel_size=conv_kernel,
-                      padding=conv_kernel // 2,
-                      groups=d_model),
-            nn.BatchNorm1d(d_model),
-            nn.SiLU(),
-            nn.Conv1d(d_model, d_model, kernel_size=1),
-            nn.Dropout(dropout),
-        )
-
-        # FFN (post) ---------------------------------------------------------
-        self.ffn2 = copy.deepcopy(self.ffn1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, T, d_model)
-        Returns:
-            (B, T, d_model)
-        """
-        # pre-FFN
+    def forward(self, x):                 # (B, T, D)
         x = x + 0.5 * self.ffn1(x)
-        # Self-attention
         x = x + self.ln_mhsa(self.mhsa(x, x, x)[0])
-        # Conv module (LayerNorm inside)
-        xc = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        x = x + xc
-        # post-FFN
+        x = x + self.conv_mod(x)
         x = x + 0.5 * self.ffn2(x)
         return x
 
@@ -676,7 +663,7 @@ class ModelVariant_Conf(nn.Module):
         )                                  # → (B, L', 256)
 
         # 4. Attention pooling -----------------------------------------------
-        rnn_feat_dim = 256 + 256 + 256     # GRU + LSTM + Conformer
+        rnn_feat_dim = 256       # Conformer
         self.attention_pooling = AttentionLayer(rnn_feat_dim)  # (B, 768)
 
         # 5. Prediction heads -------------------------------------------------
@@ -720,17 +707,10 @@ class ModelVariant_Conf(nn.Module):
 
         combined = torch.cat(branch_outs, dim=2)       # (B, L', 48*C)
 
-        # ===== BiGRU & BiLSTM =====
-        gru_out, _  = self.bigru(combined)     # (B, L', 256)
-        lstm_out, _ = self.bilstm(combined)    # (B, L', 256)
-
         # ===== Conformer =====
         conf_in = self.in_proj(combined)       # (B, L', 256)
         conf_out = self.conformer(conf_in)     # (B, L', 256)
-
-        # ===== Concat & Attention pooling =====
-        feat_cat = torch.cat([gru_out, lstm_out, conf_out], dim=2)  # (B, L', 768)
-        pooled = self.attention_pooling(feat_cat)                   # (B, 768)
+        pooled = self.attention_pooling(conf_out)                   # (B, 768)
 
         # ===== Heads =====
         fused = torch.cat([pooled, meta_proj], dim=1)   # (B, 800)
