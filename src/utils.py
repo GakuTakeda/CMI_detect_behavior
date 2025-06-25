@@ -10,6 +10,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data.dataloader import default_collate
 from scipy.spatial.transform import Rotation as R
 import copy
+import warnings
 
 def remove_outliers(df: pd.DataFrame, threshold: int = 300) -> pd.DataFrame:
     df = df.copy()
@@ -83,7 +84,19 @@ def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
     # df['linear_acc_mag'] = np.sqrt(df['linear_acc_x']**2 + df['linear_acc_y']**2 + df['linear_acc_z']**2)
     # df['linear_acc_mag_jerk'] = df.groupby('sequence_id')['linear_acc_mag'].diff().fillna(0)
 
-    insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel']
+    tof_pixel_cols = [f"tof_{i}_v{p}" for i in range(1, 6) for p in range(64)]
+    tof_data_np = df[tof_pixel_cols].replace(-1, np.nan).to_numpy()
+    reshaped_tof = tof_data_np.reshape(len(df), 5, 64)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', r'Mean of empty slice'); warnings.filterwarnings('ignore', r'Degrees of freedom <= 0 for slice')
+        mean_vals, std_vals = np.nanmean(reshaped_tof, axis=2), np.nanstd(reshaped_tof, axis=2)
+        min_vals, max_vals = np.nanmin(reshaped_tof, axis=2), np.nanmax(reshaped_tof, axis=2)
+    tof_agg_cols = []
+    for i in range(1, 6):
+        df[f'tof_{i}_mean'], df[f'tof_{i}_std'] = mean_vals[:, i-1], std_vals[:, i-1]
+        df[f'tof_{i}_min'], df[f'tof_{i}_max'] = min_vals[:, i-1], max_vals[:, i-1]
+        tof_agg_cols.extend([f'tof_{i}_mean', f'tof_{i}_std', f'tof_{i}_min', f'tof_{i}_max'])
+    insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel', *tof_agg_cols]
     cols = list(df.columns)
 
     for i, col in enumerate(cols):

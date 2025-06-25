@@ -84,7 +84,7 @@ def run(cfg: DictConfig):
                     checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_{fold+1}.ckpt"),
                     cfg          = 0,
                     imu_ch       = 11,
-                    tof_ch       = 325,
+                    tof_ch       = 345,
                     num_classes  = 18,
                 )
             model.eval()
