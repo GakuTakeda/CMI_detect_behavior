@@ -630,7 +630,11 @@ class ModelVariant_Conf(nn.Module):
     """
     def __init__(self,
                  num_classes: int,
-                 num_channels: int = 11):
+                 num_channels: int = 11,
+                 dense_drop: float = 0.2,
+                 conv_drop: float = 0.3,
+                 noise_std: float = 0.09,
+                 ):
         super().__init__()
 
         # 1. Meta features ----------------------------------------------------
@@ -639,15 +643,15 @@ class ModelVariant_Conf(nn.Module):
             nn.Linear(5 * num_channels, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(dense_drop),
         )
 
         # 2. Per-channel CNN --------------------------------------------------
         self.branches = nn.ModuleList([
             nn.Sequential(
                 MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
-                ResidualSEBlock(36, 48, 3, drop=0.3),
-                ResidualSEBlock(48, 48, 3, drop=0.3),
+                ResidualSEBlock(36, 48, 3, drop=conv_drop),
+                ResidualSEBlock(48, 48, 3, drop=conv_drop),
             )
             for _ in range(num_channels)
         ])
@@ -662,8 +666,10 @@ class ModelVariant_Conf(nn.Module):
             ConformerBlock(d_model=d_model, n_heads=4),
         )                                  # → (B, L', 256)
 
+        self.noise = GaussianNoise(noise_std)
+
         # 4. Attention pooling -----------------------------------------------
-        rnn_feat_dim = 256       # Conformer
+        rnn_feat_dim = 784       # Conformer
         self.attention_pooling = AttentionLayer(rnn_feat_dim)  # (B, 768)
 
         # 5. Prediction heads -------------------------------------------------
@@ -710,7 +716,11 @@ class ModelVariant_Conf(nn.Module):
         # ===== Conformer =====
         conf_in = self.in_proj(combined)       # (B, L', 256)
         conf_out = self.conformer(conf_in)     # (B, L', 256)
-        pooled = self.attention_pooling(conf_out)                   # (B, 768)
+        noise_out = self.noise(combined)
+
+        out = torch.cat([conf_out, noise_out], dim=2)
+
+        pooled = self.attention_pooling(out)                   # (B, 768)
 
         # ===== Heads =====
         fused = torch.cat([pooled, meta_proj], dim=1)   # (B, 800)

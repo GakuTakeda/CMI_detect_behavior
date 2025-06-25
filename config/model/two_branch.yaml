@@ -5,3 +5,7 @@ tof_ch: null
 conv_ch: 64
 lstm_units: 128
 classes: null           # 自動計算
+
+drop: 0.3
+lr: 1e-3
+weight_decay: 1e-4

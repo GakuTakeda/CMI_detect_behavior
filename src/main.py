@@ -30,6 +30,9 @@ def run(cfg: DictConfig):
             num_classes=dm.num_classes,
             lr_init=cfg.train.lr_init,
             weight_decay=cfg.train.weight_decay,
+            dense_drop=cfg.train.dense_drop,
+            conv_drop=cfg.train.conv_drop,
+            noise_std=cfg.train.noise_std,
             class_weight=dm.class_weight
         )
 

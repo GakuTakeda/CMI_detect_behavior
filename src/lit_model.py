@@ -90,13 +90,27 @@ class LitModelVariantGRU(L.LightningModule):
         weight_decay: float = 1e-4,
         cls_loss_weight: float = 1.0,
         reg_loss_weight: float = 0.1,
+        dense_drop: float = 0.2,
+        rnn_drop: float = 0.2,
+        conv_drop: float = 0.3,
+        attn_drop: float = 0.1,
+        noise_std: float = 0.09,
+        rnn_units: int = 128,
+        rnn_layers: int = 2,
         class_weight: torch.Tensor | None = None,   # CE のクラス重み
     ):
         super().__init__()
         self.save_hyperparameters()
 
         # --- core model -----------------------------------------------------
-        self.model = ModelVariant_LSTMGRU(num_classes=num_classes)
+        self.model = ModelVariant_LSTMGRU(num_classes=num_classes,
+                                          dense_drop=dense_drop,
+                                          rnn_drop=rnn_drop,
+                                          conv_drop=conv_drop,
+                                          attn_drop=attn_drop,
+                                          noise_std=noise_std,
+                                          rnn_units=rnn_units,
+                                          rnn_layers=rnn_layers)
 
         # 損失関数
         self.mse = nn.MSELoss()   # 回帰用
@@ -204,6 +218,9 @@ class LitModelVariantConf(L.LightningModule):
         num_classes: int,
         lr_init: float = 1e-3,
         weight_decay: float = 1e-4,
+        dense_drop: float = 0.2,
+        conv_drop: float = 0.3,
+        noise_std: float = 0.09,
         cls_loss_weight: float = 1.0,
         reg_loss_weight: float = 0.1,
         class_weight: torch.Tensor | None = None,   # CE のクラス重み
@@ -212,7 +229,10 @@ class LitModelVariantConf(L.LightningModule):
         self.save_hyperparameters()
 
         # --- core model -----------------------------------------------------
-        self.model = ModelVariant_Conf(num_classes=num_classes)
+        self.model = ModelVariant_Conf(num_classes=num_classes,
+                                       dense_drop=dense_drop,
+                                       conv_drop=conv_drop,
+                                       noise_std=noise_std)
 
         # 損失関数
         self.mse = nn.MSELoss()   # 回帰用
