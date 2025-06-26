@@ -83,7 +83,7 @@ def run(cfg: DictConfig):
             model = LitGestureClassifier.load_from_checkpoint(
                     checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_{fold+1}.ckpt"),
                     cfg          = 0,
-                    imu_ch       = 11,
+                    imu_ch       = 15,
                     tof_ch       = 345,
                     num_classes  = 18,
                 )
