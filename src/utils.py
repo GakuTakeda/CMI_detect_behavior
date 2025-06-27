@@ -73,6 +73,78 @@ def remove_gravity_from_acc_in_train(df: pd.DataFrame) -> pd.DataFrame:
     df[['linear_acc_x', 'linear_acc_y', 'linear_acc_z']] = linear_acc_all
     return df
 
+def calculate_angular_velocity_from_quat(rot_data, time_delta=1/200): # Assuming 200Hz sampling rate
+    if isinstance(rot_data, pd.DataFrame):
+        quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+    else:
+        quat_values = rot_data
+
+    num_samples = quat_values.shape[0]
+    angular_vel = np.zeros((num_samples, 3))
+
+    for i in range(num_samples - 1):
+        q_t = quat_values[i]
+        q_t_plus_dt = quat_values[i+1]
+
+        if np.all(np.isnan(q_t)) or np.all(np.isclose(q_t, 0)) or \
+           np.all(np.isnan(q_t_plus_dt)) or np.all(np.isclose(q_t_plus_dt, 0)):
+            continue
+
+        try:
+            rot_t = R.from_quat(q_t)
+            rot_t_plus_dt = R.from_quat(q_t_plus_dt)
+
+            # Calculate the relative rotation
+            delta_rot = rot_t.inv() * rot_t_plus_dt
+            
+            # Convert delta rotation to angular velocity vector
+            # The rotation vector (Euler axis * angle) scaled by 1/dt
+            # is a good approximation for small delta_rot
+            angular_vel[i, :] = delta_rot.as_rotvec() / time_delta
+        except ValueError:
+            # If quaternion is invalid, angular velocity remains zero
+            pass
+            
+    return angular_vel
+
+def calculate_angular_distance(rot_data):
+    if isinstance(rot_data, pd.DataFrame):
+        quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+    else:
+        quat_values = rot_data
+
+    num_samples = quat_values.shape[0]
+    angular_dist = np.zeros(num_samples)
+
+    for i in range(num_samples - 1):
+        q1 = quat_values[i]
+        q2 = quat_values[i+1]
+
+        if np.all(np.isnan(q1)) or np.all(np.isclose(q1, 0)) or \
+           np.all(np.isnan(q2)) or np.all(np.isclose(q2, 0)):
+            angular_dist[i] = 0 # Или np.nan, в зависимости от желаемого поведения
+            continue
+        try:
+            # Преобразование кватернионов в объекты Rotation
+            r1 = R.from_quat(q1)
+            r2 = R.from_quat(q2)
+
+            # Вычисление углового расстояния: 2 * arccos(|real(p * q*)|)
+            # где p* - сопряженный кватернион q
+            # В scipy.spatial.transform.Rotation, r1.inv() * r2 дает относительное вращение.
+            # Угол этого относительного вращения - это и есть угловое расстояние.
+            relative_rotation = r1.inv() * r2
+            
+            # Угол rotation vector соответствует угловому расстоянию
+            # Норма rotation vector - это угол в радианах
+            angle = np.linalg.norm(relative_rotation.as_rotvec())
+            angular_dist[i] = angle
+        except ValueError:
+            angular_dist[i] = 0 # В случае недействительных кватернионов
+            pass
+            
+    return angular_dist
+
 
 def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
     # df = remove_gravity_from_acc_in_train(df)
@@ -82,8 +154,14 @@ def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
     df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
     # df['linear_acc_mag'] = np.sqrt(df['linear_acc_x']**2 + df['linear_acc_y']**2 + df['linear_acc_z']**2)
     # df['linear_acc_mag_jerk'] = df.groupby('sequence_id')['linear_acc_mag'].diff().fillna(0)
+    rot_data = df[['rot_x', 'rot_y', 'rot_z', 'rot_w']]
+    angular_vel_group = calculate_angular_velocity_from_quat(rot_data)
+    df['angular_vel_x'] = angular_vel_group[:, 0]
+    df['angular_vel_y'] = angular_vel_group[:, 1]
+    df['angular_vel_z'] = angular_vel_group[:, 2]
+    df['angular_dist'] = calculate_angular_distance(rot_data)
 
-    insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel']
+    insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z', 'angular_dist']
     cols = list(df.columns)
 
     for i, col in enumerate(cols):
@@ -630,7 +708,7 @@ class ModelVariant_Conf(nn.Module):
     """
     def __init__(self,
                  num_classes: int,
-                 num_channels: int = 11,
+                 num_channels: int = 15,
                  dense_drop: float = 0.2,
                  conv_drop: float = 0.3,
                  noise_std: float = 0.09,
@@ -669,7 +747,7 @@ class ModelVariant_Conf(nn.Module):
         self.noise = GaussianNoise(noise_std)
 
         # 4. Attention pooling -----------------------------------------------
-        rnn_feat_dim = 784       # Conformer
+        rnn_feat_dim = 976       # Conformer
         self.attention_pooling = AttentionLayer(rnn_feat_dim)  # (B, 768)
 
         # 5. Prediction heads -------------------------------------------------
