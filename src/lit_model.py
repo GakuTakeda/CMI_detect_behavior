@@ -1,7 +1,7 @@
 # src/lit_module.py
 import torch, lightning as L, numpy as np
 from sklearn.utils.class_weight import compute_class_weight
-from utils import TwoBranchModel, ModelVariant_LSTMGRU
+from utils import TwoBranchModel, ModelVariant_LSTMGRU, ModelVariant_LSTMGRU_TinyCNN, ModelVariant_Conf
 from omegaconf import OmegaConf
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,18 +10,112 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim import Adam
 from torchmetrics.classification import MulticlassAccuracy
 
-class LitGestureClassifier(L.LightningModule):
+class LitGestureClassifier_for_tof(L.LightningModule):
+    def __init__(self, cfg, imu_ch, tof_ch,
+                 num_classes, class_weight, steps_per_epoch, imu_only=False, conv_ch=64, lstm_units=128,
+                 lr_init=1e-3, weight_decay=1e-4, t0_factor=5, cls_loss_weight=1.0):
+        super().__init__()
+
+        self.model = ModelVariant_LSTMGRU_TinyCNN(imu_dim=imu_ch, num_classes=num_classes)
+
+        self.save_hyperparameters()
+        # 損失関数
+        self.mse = nn.MSELoss()   # 回帰用
+
+        # logging 用
+        self.train_acc = MulticlassAccuracy(num_classes=num_classes, average="macro")
+        self.val_acc   = MulticlassAccuracy(num_classes=num_classes, average="macro")
+        
+        self.register_buffer(
+            "class_weight",
+            torch.tensor(class_weight, dtype=torch.float32)
+        )
+
+    # --------------------------------------------------------------------- #
+    # forward はそのまま
+    def forward(self, x, img):
+        return self.model(x, img)   # -> (logits, regression)
+
+    # --------------------------------------------------------------------- #
+    def _shared_step(self, batch, stage: str):
+        """
+        共通処理（train/val/test）
+        """
+
+        x, img, y_cls = batch
+
+        logits = self(x, img)
+        # --- 損失計算 ------------------------------------------------------
+        ce = nn.CrossEntropyLoss(weight=self.class_weight)
+        loss_cls = ce(logits, y_cls.argmax(dim=1) if y_cls.ndim == 2 else y_cls)
+        loss = self.hparams.cls_loss_weight * loss_cls
+
+        # --- ログ ----------------------------------------------------------
+        probs = F.softmax(logits, dim=1)
+        preds = probs.argmax(dim=1)
+
+        if stage == "train":
+            self.train_acc(preds, y_cls.argmax(dim=1) if y_cls.ndim == 2 else y_cls)
+            self.log_dict(
+                {
+                    "train/loss": loss,
+                    "train/loss_cls": loss_cls,
+                    "train/acc": self.train_acc,
+                },
+                on_step=False, on_epoch=True, prog_bar=True,
+            )
+        elif stage == "val":
+            self.val_acc(preds, y_cls.argmax(dim=1) if y_cls.ndim == 2 else y_cls)
+            self.log_dict(
+                {
+                    "val/loss": loss,
+                    "val/loss_cls": loss_cls,
+                    "val/acc": self.val_acc,
+                },
+                on_step=False, on_epoch=True, prog_bar=True,
+            )
+        else:  # test
+            self.log_dict(
+                {"test/loss": loss, "test/loss_cls": loss_cls},
+                on_step=False, on_epoch=True,
+            )
+        return loss
+
+    # --------------------------------------------------------------------- #
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        self._shared_step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        self._shared_step(batch, "test")
+
+    # --------------------------------------------------------------------- #
+    def configure_optimizers(self):
+        opt = Adam(self.parameters(),
+                   lr=self.hparams.lr_init,
+                   weight_decay=self.hparams.weight_decay)
+
+        # Plateau で LR 半減
+        scheduler = {
+            "scheduler": ReduceLROnPlateau(opt,
+                                           mode="min",
+                                           patience=2,
+                                           factor=0.5),
+            "monitor": "val/loss",
+        }
+        return {"optimizer": opt, "lr_scheduler": scheduler}
+
+
+
+class LitTwoBranch(L.LightningModule):
     def __init__(self, cfg, imu_ch, tof_ch,
                  num_classes, class_weight, steps_per_epoch, imu_only=False, conv_ch=64, lstm_units=128,
                  lr_init=1e-3, weight_decay=1e-4, t0_factor=5,):
         super().__init__()
 
-        if imu_only == True:
-            self.model = ModelVariant_LSTMGRU(num_classes=9)
-        else:
-            self.model = TwoBranchModel(
-                imu_ch, tof_ch, num_classes
-            )
+        self.model = TwoBranchModel(imu_ch, tof_ch, num_classes)
 
         self.save_hyperparameters()   
 
@@ -168,6 +262,114 @@ class LitModelVariantGRU(L.LightningModule):
         else:  # test
             self.log_dict(
                 {"test/loss": loss, "test/loss_cls": loss_cls, "test/loss_reg": loss_reg},
+                on_step=False, on_epoch=True,
+            )
+        return loss
+
+    # --------------------------------------------------------------------- #
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        self._shared_step(batch, "val")
+
+    def test_step(self, batch, batch_idx):
+        self._shared_step(batch, "test")
+
+    # --------------------------------------------------------------------- #
+    def configure_optimizers(self):
+        opt = Adam(self.parameters(),
+                   lr=self.hparams.lr_init,
+                   weight_decay=self.hparams.weight_decay)
+
+        # Plateau で LR 半減
+        scheduler = {
+            "scheduler": ReduceLROnPlateau(opt,
+                                           mode="min",
+                                           patience=2,
+                                           factor=0.5),
+            "monitor": "val/loss",
+        }
+        return {"optimizer": opt, "lr_scheduler": scheduler}
+    
+class LitModelVariantConf(L.LightningModule):
+    def __init__(
+        self,
+        num_classes: int,
+        lr_init: float = 1e-3,
+        weight_decay: float = 1e-4,
+        dense_drop: float = 0.2,
+        conv_drop: float = 0.3,
+        noise_std: float = 0.09,
+        cls_loss_weight: float = 1.0,
+        reg_loss_weight: float = 0.1,
+        class_weight: torch.Tensor | None = None,   # CE のクラス重み
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        # --- core model -----------------------------------------------------
+        self.model = ModelVariant_Conf(num_classes=num_classes,
+                                       dense_drop=dense_drop,
+                                       conv_drop=conv_drop,
+                                       noise_std=noise_std)
+
+        # 損失関数
+        self.mse = nn.MSELoss()   # 回帰用
+
+        # logging 用
+        self.train_acc = MulticlassAccuracy(num_classes=num_classes, average="macro")
+        self.val_acc   = MulticlassAccuracy(num_classes=num_classes, average="macro")
+        
+        self.register_buffer(
+            "class_weight",
+            torch.tensor(class_weight, dtype=torch.float32)
+        )
+
+    # --------------------------------------------------------------------- #
+    # forward はそのまま
+    def forward(self, x):
+        return self.model(x)   # -> (logits, regression)
+
+    # --------------------------------------------------------------------- #
+    def _shared_step(self, batch, stage: str):
+        """
+        共通処理（train/val/test）
+        """
+        x, y_cls = batch
+
+        logits = self(x)
+        # --- 損失計算 ------------------------------------------------------
+        ce = nn.CrossEntropyLoss(weight=self.class_weight)
+        loss_cls = ce(logits, y_cls.argmax(dim=1) if y_cls.ndim == 2 else y_cls)
+        loss = self.hparams.cls_loss_weight * loss_cls
+        # --- ログ ----------------------------------------------------------
+        probs = F.softmax(logits, dim=1)
+        preds = probs.argmax(dim=1)
+
+        if stage == "train":
+            self.train_acc(preds, y_cls.argmax(dim=1) if y_cls.ndim == 2 else y_cls)
+            self.log_dict(
+                {
+                    "train/loss": loss,
+                    "train/loss_cls": loss_cls,
+                    "train/acc": self.train_acc,
+                },
+                on_step=False, on_epoch=True, prog_bar=True,
+            )
+        elif stage == "val":
+            self.val_acc(preds, y_cls.argmax(dim=1) if y_cls.ndim == 2 else y_cls)
+            self.log_dict(
+                {
+                    "val/loss": loss,
+                    "val/loss_cls": loss_cls,
+                    "val/acc": self.val_acc,
+                },
+                on_step=False, on_epoch=True, prog_bar=True,
+            )
+        else:  # test
+            self.log_dict(
+                {"test/loss": loss, "test/loss_cls": loss_cls},
                 on_step=False, on_epoch=True,
             )
         return loss

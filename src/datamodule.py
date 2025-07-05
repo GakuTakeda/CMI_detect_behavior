@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
-from utils import preprocess_sequence, SequenceDataset, mixup_collate_fn, feature_eng
+from utils import preprocess_sequence, SequenceDataset, SequenceDataset_for_tof, mixup_collate_fn, feature_eng, Augment
 from sklearn.utils.class_weight import compute_class_weight
 from hydra.core.hydra_config import HydraConfig
 import math
@@ -23,7 +23,6 @@ class GestureDataModule(L.LightningDataModule):
         self.batch      = cfg.train.batch_size
         self.batch_val  = cfg.train.batch_size_val
         self.mixup_a    = cfg.train.mixup_alpha
-
     # prepare_data は最初の fold だけ呼ばれれば OK
     def prepare_data(self):
         df = pd.read_csv(self.raw_dir / "train.csv")
@@ -49,7 +48,8 @@ class GestureDataModule(L.LightningDataModule):
         meta = {'gesture','gesture_int','sequence_type','behavior','orientation',
                 'row_id','subject','phase','sequence_id','sequence_counter'}
 
-        le = LabelEncoder(); df["gesture_int"] = le.fit_transform(df["gesture"])
+        le = LabelEncoder()
+        df["gesture_int"] = le.fit_transform(df["gesture"])
         self.num_classes = len(le.classes_)
 
 
@@ -57,6 +57,7 @@ class GestureDataModule(L.LightningDataModule):
 
         imu_cols = [c for c in self.feat_cols
                     if not (c.startswith("thm_") or c.startswith("tof_"))]
+        tof_cols = [c for c in self.feat_cols if c.startswith("tof_")]
         self.imu_ch = len(imu_cols)
         self.tof_ch = len(self.feat_cols) - self.imu_ch
 
@@ -65,6 +66,7 @@ class GestureDataModule(L.LightningDataModule):
         # ---- 全シーケンスをテンソル化 ----
         X_l, y_l, lens = [], [], []
         for _, seq in df.groupby("sequence_id"):
+
             X_l.append(preprocess_sequence(seq, self.feat_cols, scaler))
             y_l.append(seq["gesture_int"].iloc[0])
             lens.append(len(X_l[-1]))
@@ -77,25 +79,52 @@ class GestureDataModule(L.LightningDataModule):
                          dtype="float32")
         for i, m in enumerate(X_l):
             X_pad[i, :min(len(m), pad_len)] = m[:pad_len]
+
+        # tof_idx = [self.feat_cols.index(c) for c in tof_cols]
+        # X_pad_tof = X_pad[..., tof_idx]
+
+        # tof_img = []
+        # for m in X_pad_tof:
+        #     tof_img.append(m.reshape(-1, 5, 8, 8))
+
+        #tof_img = np.array(tof_img)
+
+        #imu_tof_idx = [self.feat_cols.index(c) for c in imu_cols + tof_cols]
+        # X_pad_imu_tof = X_pad[..., imu_tof_idx]
+
         y_int = np.array(y_l)
         y_oh  = np.eye(self.num_classes)[y_int].astype("float32")
+
+        self.augmenter = Augment(imu_dim=self.imu_ch,
+        p_jitter=0.984, sigma=0.0329, scale_range=(0.754,1.163),
+        p_dropout=0.418,
+        p_moda=0.391, drift_std=0.004, drift_max=0.393    
+        )        
 
         # ---- StratifiedKFold で index を取得 ----
         skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
                               random_state=self.cfg.data.random_seed)
         tr_idx, val_idx = list(skf.split(X_pad, y_int))[self.fold_idx]
 
-        X_tr, X_val = X_pad[tr_idx], X_pad[val_idx]
-        y_tr, y_val = y_oh [tr_idx], y_oh [val_idx]
 
-        self.ds_tr  = SequenceDataset(X_tr , y_tr )
-        self.ds_val = SequenceDataset(X_val, y_val)
 
         imu_idx = [self.feat_cols.index(c) for c in imu_cols]   # IMU 列のインデックス
-        X_pad_imu = X_pad[..., imu_idx]                         # shape: (N, pad_len, imu_ch)
 
-        self.ds_tr_imu  = SequenceDataset(X_pad_imu[tr_idx], y_tr)
-        self.ds_val_imu = SequenceDataset(X_pad_imu[val_idx], y_val)
+        X_tr, X_val = X_pad[tr_idx], X_pad[val_idx]
+        # X_tr_imu_tof, X_val_imu_tof = X_pad_imu_tof[tr_idx], X_pad_imu_tof[val_idx]
+        # tof_img_tr, tof_img_val = tof_img[tr_idx], tof_img[val_idx]
+        X_tr_imu, X_val_imu = X_tr[..., imu_idx], X_val[..., imu_idx]
+        y_tr, y_val = y_oh [tr_idx], y_oh [val_idx]
+
+        # ---- データセットを作成 ----
+        # self.ds_tr  = SequenceDataset(X_tr, y_tr)
+        # self.ds_val = SequenceDataset(X_val, y_val)
+        # self.ds_tr_imu_tof  = SequenceDataset(X_tr_imu_tof, y_tr)
+        # self.ds_val_imu_tof = SequenceDataset(X_val_imu_tof, y_val)
+        # self.ds_tr_img  = SequenceDataset_for_tof(X_tr_imu , tof_img_tr, y_tr )
+        # self.ds_val_img = SequenceDataset_for_tof(X_val_imu, tof_img_val, y_val)
+        self.ds_tr_imu  = SequenceDataset(X_tr_imu, y_tr)
+        self.ds_val_imu = SequenceDataset(X_val_imu, y_val)
 
         # ---- fold 内の class_weight ----
         self.class_weight = compute_class_weight(
@@ -106,20 +135,37 @@ class GestureDataModule(L.LightningDataModule):
         self.steps_per_epoch = math.ceil(len(tr_idx) / self.batch)
 
     # ---------- DataLoaders ----------
+
     def train_dataloader(self):
         return DataLoader(self.ds_tr,  batch_size=self.batch, shuffle=True,
                           collate_fn=mixup_collate_fn(self.mixup_a),
                           drop_last=True)
-
+    
     def val_dataloader(self):
         return DataLoader(self.ds_val, batch_size=self.batch_val,
                           collate_fn=mixup_collate_fn(0.0))
 
+    def train_dataloader_imu_tof(self):
+        return DataLoader(self.ds_tr_imu_tof,  batch_size=self.batch, shuffle=True,
+                          collate_fn=mixup_collate_fn(self.mixup_a),
+                          drop_last=True)
+    
+    def val_dataloader_imu_tof(self):
+        return DataLoader(self.ds_val_imu_tof, batch_size=self.batch_val,
+                          collate_fn=mixup_collate_fn(0.0))
+    
+    def train_dataloader_img(self):
+        return DataLoader(self.ds_tr_img,  batch_size=self.batch, shuffle=True,
+                          drop_last=True)
+
+    def val_dataloader_img(self):
+        return DataLoader(self.ds_val_img, batch_size=self.batch_val)
+
     def train_dataloader_imu(self):
         return DataLoader(self.ds_tr_imu, batch_size=self.batch, shuffle=True,
                           collate_fn=mixup_collate_fn(self.mixup_a),
-                          drop_last=True)
+                          drop_last=True, num_workers=4)
 
     def val_dataloader_imu(self):
         return DataLoader(self.ds_val_imu, batch_size=self.batch_val,
-                          collate_fn=mixup_collate_fn(0.0))
+                          collate_fn=mixup_collate_fn(0.0), num_workers=4)
