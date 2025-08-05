@@ -19,226 +19,18 @@ from torch.nn import init
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score
-
 from scipy.signal import cont2discrete
+from typing import List
 
-
-class calc_f1:
-    def __init__(self):
-        self.target_gestures = [
-            'Above ear - pull hair',
-            'Cheek - pinch skin',
-            'Eyebrow - pull hair',
-            'Eyelash - pull hair',
-            'Forehead - pull hairline',
-            'Forehead - scratch',
-            'Neck - pinch skin',
-            'Neck - scratch',
-        ]
-        self.non_target_gestures = [
-            'Write name on leg',
-            'Wave hello',
-            'Glasses on/off',
-            'Text on phone',
-            'Write name in air',
-            'Feel around in tray and pull out an object',
-            'Scratch knee/leg skin',
-            'Pull air toward your face',
-            'Drink from bottle/cup',
-            'Pinch knee/leg skin'
-        ]
-        self.all_classes = self.target_gestures + self.non_target_gestures
-
-    def binary_score(self, sol, sub):
-        y_true_bin = [1 if i in self.target_gestures else 0 for i in sol]
-        y_pred_bin = [1 if i in self.target_gestures else 0 for i in sub]
-        f1_binary = f1_score(
-            y_true_bin,
-            y_pred_bin,
-            pos_label=True,
-            zero_division=0,
-            average='binary'
-            )
-    
-        return 0.5 * f1_binary   
-
-    def macro_score(self, sol, sub):
-        y_true_mc = [x if x in self.target_gestures else 'non_target' for x in sol]
-        y_pred_mc = [x if x in self.target_gestures else 'non_target' for x in sub]
-
-        # Compute macro F1 over all gesture classes
-        f1_macro = f1_score(
-            y_true_mc,
-            y_pred_mc,
-            average='macro',
-            zero_division=0
-        )
-    
-        return 0.5 * f1_macro
-
-
-def extract_seq(train, target):
-    train_df = train.copy()
-    list_ = []
-    for _, df in train_df.groupby("sequence_id"):
-        if df["gesture"].iloc[0] == target:
-            list_.append(df)
-    
-    return list_
-
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-
-def plot_behavior(seq):
-    seq = feature_eng(seq)
-
-    # ---------------- 行動→色 ----------------
-    behav_colors = {
-        "Relaxes and moves hand to target location": "#c0dffd",
-        "Moves hand to target location"            : "#c0dffd",
-        "Hand at target location"                  : "#c4f2c4",
-        "Performs gesture"                         : "#ffc8c8",
-    }
-
-    # ---------------- 変化点で区間抽出 ----------------
-    seg_id   = (seq["behavior"] != seq["behavior"].shift()).cumsum()
-    grouped  = seq.groupby(seg_id, sort=False)
-
-    # ---------------- プロット ----------------
-    # ←★ ここに列を追加するだけ★→
-    signals = [
-        ("acc_x",   "acceleration_X"),
-        ("acc_y",   "acceleration_Y"),
-        ("acc_z",   "acceleration_Z"),
-        ("acc_mag", "acceleration_magnitude"),
-        ("rot_x",   "rotation_X"),
-        ("rot_y",   "rotation_Y"),
-        ("rot_z",   "rotation_Z"),
-        ("rot_w",   "rotation_W"),
-        ("rot_angle", "rotation_angle"),
-    ]
-
-    # 軸を「signals の要素数」だけ作成
-    fig, axes = plt.subplots(len(signals), 1, figsize=(12, 2.2*len(signals)), sharex=True)
-
-    # ▲― signals と axes の数が一致するよう保証される
-    for ax, (col, label) in zip(axes, signals):
-        if col not in seq.columns:
-            ax.text(0.5, 0.5, f"'{col}' not found", ha="center", va="center", transform=ax.transAxes)
-            ax.set_ylabel(label)
-            continue
-
-        ax.plot(seq["sequence_counter"], seq[col], label=label)
-        ax.set_ylabel(label)
-
-    # ----------- 背景塗り -----------
-    legend_patches = []
-    seen_behaviors = set()
-
-    for _, segment in grouped:
-        behav = segment["behavior"].iloc[0]
-        if behav not in behav_colors:
-            continue
-        x0 = segment["sequence_counter"].iloc[0]
-        x1 = segment["sequence_counter"].iloc[-1]
-
-        for ax in axes:
-            ax.axvspan(x0, x1, color=behav_colors[behav], alpha=0.25, linewidth=0)
-
-        if behav not in seen_behaviors:
-            legend_patches.append(mpatches.Patch(color=behav_colors[behav],
-                                                 alpha=0.25, label=behav))
-            seen_behaviors.add(behav)
-
-    axes[0].legend(handles=legend_patches, loc="upper right", fontsize=8)
-    axes[-1].set_xlabel("sequence_counter")
-
-    plt.tight_layout()
-    plt.show()
-
-
-def labeling(value):
-
-    BFRB = [
-        "Above ear - pull hair", "Forehead - pull hairline", "Forehead - scratch",
-        "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
-        "Neck - scratch", "Cheek - pinch skin"
-    ]
-    
-    non_BFRB = [
-        "Drink from bottle/cup", "Glasses on/off", "Pull air toward your face",
-        "Pinch knee/leg skin", "Scratch knee/leg skin", "Write name on leg",
-        "Text on phone", "Feel around in tray and pull out an object",
-        "Write name in air", "Wave hello"
-    ]
-    
-    # BFRBリスト内の値であれば、そのインデックスを返す
-    if value in BFRB:
-        return BFRB.index(value)
-    
-    # non_BFRBリスト内の値であれば、BFRBの長さ + そのインデックスを返す
-    elif value in non_BFRB:
-        return len(BFRB) + non_BFRB.index(value)
-
-    elif value == "classes":
-        return [
-            "Above ear - pull hair", "Forehead - pull hairline", "Forehead - scratch",
-            "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
-            "Neck - scratch", "Cheek - pinch skin", "Drink from bottle/cup", "Glasses on/off", "Pull air toward your face",
-            "Pinch knee/leg skin", "Scratch knee/leg skin", "Write name on leg",
-            "Text on phone", "Feel around in tray and pull out an object",
-            "Write name in air", "Wave hello"
-            ]
-
-def convert_gesture(value):
-    pull = ["Eyebrow - pull hair", "Eyelash - pull hair", "Forehead - pull hairline"]
-    if value in pull:
-        return "pull"
+def phase_to_int(value):
+    if value in ["Relaxes and moves hand to target location", "Moves hand to target location"]:
+        return 0
+    elif value == "Performs gesture":
+        return 1
     else:
-        return value
+        return ["Relaxes and moves hand to target location", "Moves hand to target location", "Performs gesture"]
 
-def labeling_for_macro(value):
 
-    BFRB = [
-        "Above ear - pull hair", "Forehead - pull hairline", "Forehead - scratch",
-        "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
-        "Neck - scratch", "Cheek - pinch skin"
-    ]
-
-    pull = ["Eyebrow - pull hair", "Eyelash - pull hair", "Forehead - pull hairline"]
-    
-    # BFRBリスト内の値であれば、そのインデックスを返す
-    if value in BFRB:
-        return BFRB.index(value)
-
-    elif value == "classes":
-        return [
-            "Above ear - pull hair", "Forehead - pull hairline", "Forehead - scratch",
-            "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
-            "Neck - scratch", "Cheek - pinch skin"]
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-# def remove_outliers(df: pd.DataFrame, threshold: int = 300) -> pd.DataFrame:
-#     df = df.copy()
-#     df_out = df.copy()
-#     tof_thm_cols = [c for c in df.columns if c.startswith("thm") or c.startswith("tof")]
-#     by_seq = (
-#         df[tof_thm_cols].eq(-1)      # == -1 と同じ
-#         .groupby(df['sequence_id'])  # sequence_id ごと
-#         .sum()                      # 列ごとの個数
-#     )
-#     null_id = []
-#     for i in range(by_seq.shape[0]):
-#         if by_seq.iloc[i].sum()/df.loc[df['sequence_id'] == by_seq.index[i], 'sequence_id'].count() > threshold:
-#             null_id.append(by_seq.index[i])
-#     return null_id
 
 def remove_outliers(df: pd.DataFrame, threshold: int = 300) -> pd.DataFrame:
     df = df.copy()
@@ -368,54 +160,80 @@ def calculate_angular_distance(rot_data):
             
     return angular_dist
 
-# def calc_z_coodinate(df):
-#     df = df.copy()
-#     cols = ["x", "y", "z"]
-#     df[cols] = 0
-#     for _, seq df.groupby("sequence_id"):
-#         for 
+
+def labeling_for_macro(value):
+
+    BFRB = [
+        "Above ear - pull hair", "Forehead - pull hairline", "Forehead - scratch",
+        "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
+        "Neck - scratch", "Cheek - pinch skin"
+    ]
+    
+    # BFRBリスト内の値であれば、そのインデックスを返す
+    if value in BFRB:
+        return BFRB.index(value)
+
+    elif value == "classes":
+        return [
+            "Above ear - pull hair", "Forehead - pull hairline", "Forehead - scratch",
+            "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
+            "Neck - scratch", "Cheek - pinch skin"]
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def quaternion_to_euler(qx, qy, qz, qw):
+    """
+    XYZ (roll, pitch, yaw) への変換
+    返り値: (roll[rad], pitch[rad], yaw[rad])
+    """
+    # roll (x 軸回り)
+    sinr = 2.0 * (qw * qx + qy * qz)
+    cosr = 1.0 - 2.0 * (qx * qx + qy * qy)
+    roll = np.arctan2(sinr, cosr)
+
+    # pitch (y 軸回り)
+    sinp = 2.0 * (qw * qy - qz * qx)
+    pitch = np.where(np.abs(sinp) >= 1,
+                     np.sign(sinp) * np.pi/2,           # gimbal lock
+                     np.arcsin(sinp))
+
+    # yaw (z 軸回り)
+    siny = 2.0 * (qw * qz + qx * qy)
+    cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
+    yaw = np.arctan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
+def Macro_eng(df: pd.DataFrame, k: int = 5) -> pd.DataFrame:
+    """
+    既存 15 ch + 姿勢角 3 ch + 移動平均/分散 (各 15 ch) ＝ 48 ch
+    """
+    df = df.sort_values(['sequence_id', 'sequence_counter']).copy()
 
-def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
-    # df = remove_gravity_from_acc_in_train(df)
-    df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
-    df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1, 1))
-    df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
-    df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
-    # df['linear_acc_mag'] = np.sqrt(df['linear_acc_x']**2 + df['linear_acc_y']**2 + df['linear_acc_z']**2)
-    # df['linear_acc_mag_jerk'] = df.groupby('sequence_id')['linear_acc_mag'].diff().fillna(0)
-    rot_data = df[['rot_x', 'rot_y', 'rot_z', 'rot_w']]
-    angular_vel_group = calculate_angular_velocity_from_quat(rot_data)
-    df['angular_vel_x'] = angular_vel_group[:, 0]
-    df['angular_vel_y'] = angular_vel_group[:, 1]
-    df['angular_vel_z'] = angular_vel_group[:, 2]
-    df['angular_dist'] = calculate_angular_distance(rot_data)
+    # --- 既存 15 ch ------------------------------------------------------
+    df['acc_mag']        = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+    df['rot_angle']      = 2 * np.arccos(df['rot_w'].clip(-1, 1))
+    df['acc_mag_jerk']   = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
+    df['rot_angle_vel']  = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
 
-    # tof_pixel_cols = [f"tof_{i}_v{p}" for i in range(1, 6) for p in range(64)]
-    # tof_data_np = df[tof_pixel_cols].replace(-1, np.nan).to_numpy()
-    # reshaped_tof = tof_data_np.reshape(len(df), 5, 64)
-    # with warnings.catch_warnings():
-    #     warnings.filterwarnings('ignore', r'Mean of empty slice'); warnings.filterwarnings('ignore', r'Degrees of freedom <= 0 for slice')
-    #     mean_vals, std_vals = np.nanmean(reshaped_tof, axis=2), np.nanstd(reshaped_tof, axis=2)
-    #     min_vals, max_vals = np.nanmin(reshaped_tof, axis=2), np.nanmax(reshaped_tof, axis=2)
-    # tof_agg_cols = []
-    # for i in range(1, 6):
-    #     df[f'tof_{i}_mean'], df[f'tof_{i}_std'] = mean_vals[:, i-1], std_vals[:, i-1]
-    #     df[f'tof_{i}_min'], df[f'tof_{i}_max'] = min_vals[:, i-1], max_vals[:, i-1]
-    #     tof_agg_cols.extend([f'tof_{i}_mean', f'tof_{i}_std', f'tof_{i}_min', f'tof_{i}_max'])
-    insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z', 'angular_dist']
-    cols = list(df.columns)
+    rot_cols = ['rot_x', 'rot_y', 'rot_z', 'rot_w']
+    rot_data = df[rot_cols].to_numpy()
+    ang_vel  = calculate_angular_velocity_from_quat(rot_data)
+    df[['angular_vel_x', 'angular_vel_y', 'angular_vel_z']] = ang_vel
+    df['angular_dist']   = calculate_angular_distance(rot_data)
 
-    for i, col in enumerate(cols):
-        if col.startswith('thm_') or col.startswith('tof_'):
-            insert_index = i
-            break
-
-    cols_wo_insert = [c for c in cols if c not in insert_cols]
-
-    new_order = cols_wo_insert[:insert_index] + insert_cols + cols_wo_insert[insert_index:]
-    df = df[new_order]
+    # --- (1) 姿勢系: pitch / roll / yaw ---------------------------------
+    roll, pitch, yaw = quaternion_to_euler(df['rot_x'], df['rot_y'], df['rot_z'], df['rot_w'])
+    df['roll']  = roll
+    df['pitch'] = pitch
+    df['yaw']   = yaw
 
     return df
 
@@ -1179,225 +997,14 @@ class LMU(nn.Module):
         output = output.permute(1, 0, 2) # [batch_size, seq_len, hidden_size]
 
         return output, state # state is (h_n, m_n) where n = seq_len
-
-class TwoBranchModel(nn.Module):
-    def __init__(self, imu_ch, tof_ch, n_classes, dropouts=[0.3, 0.3, 0.3, 0.3, 0.4, 0.5, 0.3]):
-        super().__init__()
-
-        self.imu_dim = imu_ch
-        self.tof_dim = tof_ch
-
-        self.fir_nchan = imu_ch
-
-        weight_decay = 3e-3
-
-        numtaps = 33  
-        fir_coef = firwin(numtaps, cutoff=1.0, fs=10.0, pass_zero=False)
-        fir_kernel = torch.tensor(fir_coef, dtype=torch.float32).view(1, 1, -1)
-        fir_kernel = fir_kernel.repeat(imu_ch, 1, 1)  # (imu_dim, 1, numtaps)
-        self.register_buffer("fir_kernel", fir_kernel)
-        
-        # IMU deep branch
-        self.imu_block1 = ResidualSECNNBlock(imu_ch, 64, 3, dropout=dropouts[0], weight_decay=weight_decay)
-        self.imu_block2 = ResidualSECNNBlock(64, 128, 5, dropout=dropouts[1], weight_decay=weight_decay)
-        
-        # TOF/Thermal lighter branch
-        self.tof_conv1 = nn.Conv1d(tof_ch, 64, 3, padding=1, bias=False)
-        self.tof_bn1 = nn.BatchNorm1d(64)
-        self.tof_pool1 = nn.MaxPool1d(2)
-        self.tof_drop1 = nn.Dropout(dropouts[2])
-        
-        self.tof_conv2 = nn.Conv1d(64, 128, 3, padding=1, bias=False)
-        self.tof_bn2 = nn.BatchNorm1d(128)
-        self.tof_pool2 = nn.MaxPool1d(2)
-        self.tof_drop2 = nn.Dropout(dropouts[3])
-        
-        # BiLSTM
-        self.bilstm = nn.LSTM(256, 128, bidirectional=True, batch_first=True)
-        self.lstm_dropout = nn.Dropout(dropouts[4])
-        
-        # Attention
-        self.attention = AttentionLayer(256)  # 128*2 for bidirectional
-        
-        # Dense layers
-        self.dense1 = nn.Linear(256, 256, bias=False)
-        self.bn_dense1 = nn.BatchNorm1d(256)
-        self.drop1 = nn.Dropout(dropouts[5])
-        
-        self.dense2 = nn.Linear(256, 128, bias=False)
-        self.bn_dense2 = nn.BatchNorm1d(128)
-        self.drop2 = nn.Dropout(dropouts[6])
-        
-        self.classifier = nn.Linear(128, n_classes)
-        
-    def forward(self, x):
-        # Split input
-        
-        imu = x[:, :, :self.fir_nchan].transpose(1, 2)  # (batch, imu_dim, seq_len)
-        tof = x[:, :, self.fir_nchan:].transpose(1, 2)  # (batch, tof_dim, seq_len)
-
-        filtered = F.conv1d(
-            imu[:, :self.fir_nchan, :],        # (B,7,T)
-            self.fir_kernel,
-            padding=self.fir_kernel.shape[-1] // 2,
-            groups=self.fir_nchan,
-        )
-        
-        imu = torch.cat([filtered, imu[:, self.fir_nchan:, :]], dim=1)  
-        # IMU branch
-        x1 = self.imu_block1(imu)
-        x1 = self.imu_block2(x1)
-        
-        # TOF branch
-        x2 = F.relu(self.tof_bn1(self.tof_conv1(tof)))
-        x2 = self.tof_drop1(self.tof_pool1(x2))
-        x2 = F.relu(self.tof_bn2(self.tof_conv2(x2)))
-        x2 = self.tof_drop2(self.tof_pool2(x2))
-        
-        # Concatenate branches
-        merged = torch.cat([x1, x2], dim=1).transpose(1, 2)  # (batch, seq_len, 256)
-        
-        # BiLSTM
-        lstm_out, _ = self.bilstm(merged)
-        lstm_out = self.lstm_dropout(lstm_out)
-        
-        # Attention
-        attended = self.attention(lstm_out)
-        
-        # Dense layers
-        x = F.relu(self.bn_dense1(self.dense1(attended)))
-        x = self.drop1(x)
-        x = F.relu(self.bn_dense2(self.dense2(x)))
-        x = self.drop2(x)
-        
-        # Classification
-        logits = (self.classifier(x))
-        return logits
     
-class TinyCNN(nn.Module):
-    def __init__(self, in_channels=5, out_dim=32):
+class rnn(nn.Module):    #output:ch*48
+    def __init__(self, num_channels, attn_ch = 2944):
+
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels,16,3,padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.Conv2d(16,32,3,padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)
-        )
-    def forward(self,x):
-        x = self.net(x)
-        return x.view(x.size(0), -1)
-    
-class ModelVariant_LSTMGRU_TinyCNN(nn.Module):
-    def __init__(self, imu_dim, num_classes):
-        super().__init__()
-        self.imu_dim = imu_dim
-        self.tof_out_dim = 32
-
-        # IMU branches
-        self.imu_branches = nn.ModuleList([
-            nn.Sequential(
-                MultiScaleConv1d(1,12),
-                ResidualSEBlock(36,48),
-                ResidualSEBlock(48,48),
-            ) for _ in range(imu_dim)
-        ])
-
-        # TOF branch
-        self.tof_cnn = TinyCNN(in_channels=5, out_dim=32)
-
-        # Meta feature
-        self.meta = MetaFeatureExtractor()
-        self.meta_dense = nn.Sequential(
-            nn.Linear(5*(imu_dim + self.tof_out_dim), 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        )
-
-        # Sequence encoders
-        self.bigru = nn.GRU(48*imu_dim + self.tof_out_dim, 128, batch_first=True, bidirectional=True, num_layers=2, dropout=0.2)
-        self.bilstm = nn.LSTM(48*imu_dim + self.tof_out_dim, 128, batch_first=True, bidirectional=True, num_layers=2, dropout=0.2)
-        self.noise = GaussianNoise(0.09)
-
-        # Attention + Head
-        concat_dim = 256 + 256 + (48*imu_dim + self.tof_out_dim)
-        self.attn = AttentionLayer(concat_dim)
-        self.head = nn.Sequential(
-            nn.Linear(concat_dim + 64, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes)
-        )
-
-    def forward(self, x_imu, x_tof):
-
-
-        # ===== IMU branch =====
-        imu_feats = []
-        for i in range(x_imu.shape[2]):
-            xi = x_imu[:,:,i].unsqueeze(1)  # (B,T,1)
-            fi = self.imu_branches[i](xi).transpose(1,2)  # (B,T,F)
-            imu_feats.append(fi)
-        imu_feat = torch.cat(imu_feats, dim=2)  # (B,T,48*imu_dim)
-
-        # ===== TOF branch =====
-        B,T,C,H,W = x_tof.shape
-        tof_flat = x_tof.view(B*T, C, H, W)  # (B*T,5,8,8)
-
-        tof_feats = self.tof_cnn(tof_flat).view(B, T, -1)  # (B,T,32)
-
-
-        # ===== align time dimension =====
-        tof_feats = F.adaptive_avg_pool1d(tof_feats.transpose(1,2), output_size=imu_feat.size(1)).transpose(1,2)
-
-
-        # ===== Meta features =====
-        meta_imu = self.meta(x_imu)       # (B,5*imu_dim)
-        meta_tof = self.meta(tof_feats)    # (B,5*32)
-        meta = torch.cat([meta_imu, meta_tof], dim=1)
-        meta = self.meta_dense(meta)       # (B,64)
-
-
-        # ===== Sequence fusion =====
-        seq = torch.cat([imu_feat, tof_feats], dim=2)  # (B,T,48*imu_dim+32)
-
-        gru,_ = self.bigru(seq)   # (B,T,256)
-        lstm,_ = self.bilstm(seq) # (B,T,256)
-        noise = self.noise(seq)   # (B,T,48*imu_dim+32)
-        x = torch.cat([gru, lstm, noise], dim=2)  # (B,T,256+256+...)
-
-
-        # ===== Attention & Head =====
-        x = self.attn(x)  # (B,256+256+...)
-
-
-        x = torch.cat([x, meta], dim=1)  # (B, ...)
-        out = self.head(x)                # (B,num_classes)
-
-        return out
-
-class ModelVariant_LSTMGRU(nn.Module):
-    """
-    IMU 専用：CNN → BiGRU ＆ BiLSTM → AttentionPooling → 2 ヘッド
-    """
-    def __init__(self, num_classes: int):
-        super().__init__()
-        num_channels = 48  # IMU チャンネル数
-
-        # 1. Meta features
-        self.meta_extractor = MetaFeatureExtractor()
-        self.meta_dense = nn.Sequential(
-            nn.Linear(5 * num_channels, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-
         # 2. Per-channel CNN branches
+        self.num_channels = num_channels
+
         self.branches = nn.ModuleList([
             nn.Sequential(
                 MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
@@ -1435,38 +1042,11 @@ class ModelVariant_LSTMGRU(nn.Module):
 
         self.noise = GaussianNoise(0.09)
 
-        # 4. Attention Pooling (GRU 256 + LSTM 256 = 512)
-        self.attention_pooling = AttentionLayer(2944)
+        self.attention_pooling = AttentionLayer(attn_ch)
 
-        # 5. Prediction heads
-        in_feat = 2944 + 32  # pooled + meta
-        self.head_1 = nn.Sequential(
-            nn.Linear(in_feat, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes),
-        )
-
-        self.head_2 = nn.Sequential(
-            nn.Linear(in_feat, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, 1),   # regression
-        )
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: (B, L, C)  – L=系列長, C=16ch
-        """
-        # ---------- meta ----------
-        meta = self.meta_extractor(x)              # (B, 5*C)
-        meta_proj = self.meta_dense(meta)          # (B, 32)
-
-        # ---------- CNN branches ----------
+    def forward(self, x):
         branch_outs = []
-        for i in range(x.shape[2]):                # each channel
+        for i in range(self.num_channels):                # each channel
             ci = x[:, :, i].unsqueeze(1)           # (B,1,L)
             out = self.branches[i](ci)             # (B,48,L')
             branch_outs.append(out.transpose(1, 2))  # → (B,L',48)
@@ -1484,413 +1064,223 @@ class ModelVariant_LSTMGRU(nn.Module):
         # ---------- Attention pooling ----------
         pooled = self.attention_pooling(rnn_cat)   # (B,512)
 
-        # ---------- Fuse & heads ----------
-        fused = torch.cat([pooled, meta_proj], dim=1)  # (B,544)
-        z_cls = self.head_1(fused)
-        z_reg = self.head_2(fused)
-        return z_cls, z_reg
-
-# ---------- Main Model ----------
-class ModelVariant_Conf(nn.Module):
-    """
-    IMU 専用:
-      ▸ Per-channel CNN
-      ▸ BiGRU ＆ BiLSTM ＆ Conformer (並列)
-      ▸ AttentionPooling
-      ▸ 2-Head (分類 + 回帰)
-    """
-    def __init__(self,
-                 num_classes: int,
-                 num_channels: int = 11):
+        return pooled        
+    
+class move_block(nn.Module):
+    def __init__(self, imu_ch: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
+        assert imu_ch % n_heads == 0, "d_model は n_heads で割り切れる必要があります"
 
-        # 1. Meta features ----------------------------------------------------
-        self.meta_extractor = MetaFeatureExtractor()          # (B, 5*C)
-        self.meta_dense = nn.Sequential(
-            nn.Linear(5 * num_channels, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(0.2),
+        self.mhsa = nn.MultiheadAttention(
+            embed_dim=imu_ch,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True         # ← [B, L, C] をそのまま渡せる
         )
+        self.ln1 = nn.LayerNorm(imu_ch)
 
-        # 2. Per-channel CNN --------------------------------------------------
-        self.branches = nn.ModuleList([
-            nn.Sequential(
-                MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
-                ResidualSEBlock(36, 48, 3, drop=0.2),
-                ResidualSEBlock(48, 48, 3, drop=0.2),
-            )
-            for _ in range(num_channels)
-        ])
-
-        proj_dim = 48 * num_channels      # 48 per-channel × #channels                         # → (B, L', 256)
-
-        # 3-c. Conformer ------------------------------------------------------
-        d_model = 256
-        self.in_proj = nn.Linear(proj_dim, d_model)
-        self.conformer = nn.Sequential(
-            ConformerBlock(d_model=d_model, n_heads=4),
-            ConformerBlock(d_model=d_model, n_heads=4),
-        )                                  # → (B, L', 256)
-
-        # 4. Attention pooling -----------------------------------------------
-        rnn_feat_dim = 256 + 256 + 256     # GRU + LSTM + Conformer
-        self.attention_pooling = AttentionLayer(rnn_feat_dim)  # (B, 768)
-
-        # 5. Prediction heads -------------------------------------------------
-        in_feat = rnn_feat_dim + 32
-        self.head = nn.Sequential(
-            nn.Linear(in_feat, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes),
+        # Position-wise FFN（Transformer エンコーダ層と同じ構成）
+        self.ffn = nn.Sequential(
+            nn.Linear(imu_ch, 4 * imu_ch),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * imu_ch, imu_ch),
+            nn.Dropout(dropout)
         )
-        self.bigru = nn.GRU(
-            input_size=48 * num_channels,
-            hidden_size=128,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2,
-        )
+        self.ln2 = nn.LayerNorm(imu_ch)
 
-        # 3-b. **BiLSTM を追加**
-        self.bilstm = nn.LSTM(
-            input_size=48 * num_channels,
-            hidden_size=128,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2,
-        )
+    def forward(self, x):           # x : [B, L, C]
+        # ① 自己注意（クエリ=キー=バリュー）
+        attn_out, _ = self.mhsa(x, x, x)     # [B, L, C]
 
-    # --------------------------------------------------------------------- #
-    def forward(self, x: torch.Tensor):
-        """
-        Args:
-            x: (B, L, C)   - L: 時系列長, C: IMU チャンネル数
-        Returns:
-            z_cls: (B, num_classes)
-            z_reg: (B, 1)
-        """
-        B, L, C = x.shape
+        # ② 残差 + LayerNorm
+        x = self.ln1(x + attn_out)
 
-        # ===== Meta features =====
-        meta = self.meta_extractor(x)          # (B, 5*C)
-        meta_proj = self.meta_dense(meta)      # (B, 32)
+        # ③ FFN
+        ffn_out = self.ffn(x)
 
-        # ===== CNN branches per channel =====
-        branch_outs = []
-        for i in range(C):
-            ci = x[:, :, i].unsqueeze(1)       # (B, 1, L)
-            out_i = self.branches[i](ci)       # (B, 48, L')
-            branch_outs.append(out_i.transpose(1, 2))  # → (B, L', 48)
-
-        combined = torch.cat(branch_outs, dim=2)       # (B, L', 48*C)
-
-        # ===== BiGRU & BiLSTM =====
-        gru_out, _  = self.bigru(combined)     # (B, L', 256)
-        lstm_out, _ = self.bilstm(combined)    # (B, L', 256)
-
-        # ===== Conformer =====
-        conf_in = self.in_proj(combined)       # (B, L', 256)
-        conf_out = self.conformer(conf_in)     # (B, L', 256)
-
-        # ===== Concat & Attention pooling =====
-        feat_cat = torch.cat([gru_out, lstm_out, conf_out], dim=2)  # (B, L', 768)
-        pooled = self.attention_pooling(feat_cat)                   # (B, 768)
-
-        # ===== Heads =====
-        fused = torch.cat([pooled, meta_proj], dim=1)   # (B, 800)
-        z_cls = self.head(fused)                 # (B, 1)
-        return z_cls
-    
-class ModelVariant_Conf(nn.Module):
-    """
-    IMU 専用:
-      ▸ Per-channel CNN
-      ▸ BiGRU ＆ BiLSTM ＆ Conformer (並列)
-      ▸ AttentionPooling
-      ▸ 2-Head (分類 + 回帰)
-    """
-    def __init__(self,
-                 num_classes: int,
-                 num_channels: int = 15,
-                 dense_drop: float = 0.2,
-                 conv_drop: float = 0.3,
-                 noise_std: float = 0.09,
-                 ):
-        super().__init__()
-
-        # 1. Meta features ----------------------------------------------------
-        self.meta_extractor = MetaFeatureExtractor()          # (B, 5*C)
-        self.meta_dense = nn.Sequential(
-            nn.Linear(5 * num_channels, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.Dropout(dense_drop),
-        )
-
-        # 2. Per-channel CNN --------------------------------------------------
-        self.branches = nn.ModuleList([
-            nn.Sequential(
-                MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),
-                ResidualSEBlock(36, 48, 3, drop=conv_drop),
-                ResidualSEBlock(48, 48, 3, drop=conv_drop),
-            )
-            for _ in range(num_channels)
-        ])
-
-        self.bigru = nn.GRU(
-            input_size=48 * num_channels,
-            hidden_size=128,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2,
-        )
-
-        # 3-b. **BiLSTM を追加**
-        self.bilstm = nn.LSTM(
-            input_size=48 * num_channels,
-            hidden_size=128,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.2,
-        )
-
-        proj_dim = 48 * num_channels      # 48 per-channel × #channels                         # → (B, L', 256)
-
-        # 3-c. Conformer ------------------------------------------------------
-        d_model = 256
-        self.in_proj = nn.Linear(proj_dim, d_model)
-        self.conformer = nn.Sequential(
-            ConformerBlock(d_model=d_model, n_heads=4),
-            ConformerBlock(d_model=d_model, n_heads=4),
-        )                                  # → (B, L', 256)
-
-        self.noise = GaussianNoise(noise_std)
-
-        # 4. Attention pooling -----------------------------------------------
-        rnn_feat_dim = 1488       # Conformer
-        self.attention_pooling = AttentionLayer(rnn_feat_dim)  # (B, 768)
-
-        # 5. Prediction heads -------------------------------------------------
-        in_feat = rnn_feat_dim + 32
-        self.head = nn.Sequential(
-            nn.Linear(in_feat, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes),
-        )
-
-
-    # --------------------------------------------------------------------- #
-    def forward(self, x: torch.Tensor):
-        """
-        Args:
-            x: (B, L, C)   - L: 時系列長, C: IMU チャンネル数
-        Returns:
-            z_cls: (B, num_classes)
-            z_reg: (B, 1)
-        """
-        B, L, C = x.shape
-
-        # ===== Meta features =====
-        meta = self.meta_extractor(x)          # (B, 5*C)
-        meta_proj = self.meta_dense(meta)      # (B, 32)
-
-        # ===== CNN branches per channel =====
-        branch_outs = []
-        for i in range(C):
-            ci = x[:, :, i].unsqueeze(1)       # (B, 1, L)
-            out_i = self.branches[i](ci)       # (B, 48, L')
-            branch_outs.append(out_i.transpose(1, 2))  # → (B, L', 48)
-
-        combined = torch.cat(branch_outs, dim=2)       # (B, L', 48*C)
-
-        # ===== Conformer =====
-        conf_in = self.in_proj(combined)       # (B, L', 256)
-        conf_out = self.conformer(conf_in)     # (B, L', 256)
-        noise_out = self.noise(combined)
-        gru_out, _  = self.bigru(combined)     # (B, L', 256)
-        lstm_out, _ = self.bilstm(combined)    # (B, L', 256)
-
-        out = torch.cat([gru_out, lstm_out, conf_out, noise_out], dim=2)
-
-        pooled = self.attention_pooling(out)                   # (B, 768)
-
-        # ===== Heads =====
-        fused = torch.cat([pooled, meta_proj], dim=1)   # (B, 800)
-        z_cls = self.head(fused)                # (B, 1)
-        return z_cls
-    
-def quaternion_to_euler(qx, qy, qz, qw):
-    """
-    XYZ (roll, pitch, yaw) への変換
-    返り値: (roll[rad], pitch[rad], yaw[rad])
-    """
-    # roll (x 軸回り)
-    sinr = 2.0 * (qw * qx + qy * qz)
-    cosr = 1.0 - 2.0 * (qx * qx + qy * qy)
-    roll = np.arctan2(sinr, cosr)
-
-    # pitch (y 軸回り)
-    sinp = 2.0 * (qw * qy - qz * qx)
-    pitch = np.where(np.abs(sinp) >= 1,
-                     np.sign(sinp) * np.pi/2,           # gimbal lock
-                     np.arcsin(sinp))
-
-    # yaw (z 軸回り)
-    siny = 2.0 * (qw * qz + qx * qy)
-    cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
-    yaw = np.arctan2(siny, cosy)
-
-    return roll, pitch, yaw
-
-
-def Macro_eng(df: pd.DataFrame, k: int = 5) -> pd.DataFrame:
-    """
-    既存 15 ch + 姿勢角 3 ch + 移動平均/分散 (各 15 ch) ＝ 48 ch
-    """
-    df = df.sort_values(['sequence_id', 'sequence_counter']).copy()
-
-    # --- 既存 15 ch ------------------------------------------------------
-    df['acc_mag']        = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
-    df['rot_angle']      = 2 * np.arccos(df['rot_w'].clip(-1, 1))
-    df['acc_mag_jerk']   = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
-    df['rot_angle_vel']  = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
-
-    rot_cols = ['rot_x', 'rot_y', 'rot_z', 'rot_w']
-    rot_data = df[rot_cols].to_numpy()
-    ang_vel  = calculate_angular_velocity_from_quat(rot_data)
-    df[['angular_vel_x', 'angular_vel_y', 'angular_vel_z']] = ang_vel
-    df['angular_dist']   = calculate_angular_distance(rot_data)
-
-    # --- (1) 姿勢系: pitch / roll / yaw ---------------------------------
-    roll, pitch, yaw = quaternion_to_euler(df['rot_x'], df['rot_y'], df['rot_z'], df['rot_w'])
-    df['roll']  = roll
-    df['pitch'] = pitch
-    df['yaw']   = yaw
-
-    # --- (2) 時間的統計: 移動平均 & 分散 -------------------------------
-    base_cols = [
-        'acc_x','acc_y','acc_z','rot_x','rot_y','rot_z','rot_w',
-        'acc_mag','rot_angle','acc_mag_jerk','rot_angle_vel',
-        'angular_vel_x','angular_vel_y','angular_vel_z','angular_dist'
-    ]  # ←15本
-
-    grouped = df.groupby('sequence_id')
-
-    # rolling 計算 (min_periods=1 で序盤も値が入る)
-    for col in base_cols:
-        df[f'{col}_ma{k}']  = grouped[col].transform(lambda x: x.rolling(k, min_periods=1).mean())
-        df[f'{col}_var{k}'] = grouped[col].transform(lambda x: x.rolling(k, min_periods=1).var().fillna(0))
-
-    return df
-    
-def hand_anno(value):
-    if value ==  'Above ear - pull hair':
-        return "ear"
-    elif value == 'Cheek - pinch skin':
-        return "cheek"
-    elif value == 'Eyebrow - pull hair':
-        return "eyebrow"
-    elif value == 'Eyelash - pull hair':
-        return 'eyelash'
-    elif value in ['Forehead - pull hairline', 'Forehead - scratch']:
-        return 'forehead'
-    elif value in ["Neck - pinch skin","Neck - scratch"]:
-        return "neck"
-    else:
-        return ["ear", "cheek", "eyebrow", "eyelash", "forehead", "neck"]
-
+        # ④ 残差 + LayerNorm
+        out = self.ln2(x + ffn_out)
+        return out #imu_ch
     
 class MacroImuModel(nn.Module):
-
-    def __init__(self, num_classes: int = 6):
+    """
+    IMU 専用：CNN → BiGRU ＆ BiLSTM → AttentionPooling → 2 ヘッド
+    """
+    def __init__(self, num_classes: int, len_move: int, len_perform: int):
         super().__init__()
-        self.num_channels = 48
-        ch = self.num_channels
+        num_channels = 18  # IMU チャンネル数
 
-        # 1. Meta features --------------------------------------------------
-        self.meta_extractor = MetaFeatureExtractor()          # (B, 5*C)
+        self.len_move = len_move
+        self.len_perform = len_perform
+
+        # 1. Meta features
+        self.meta_extractor = MetaFeatureExtractor()
         self.meta_dense = nn.Sequential(
-            nn.Linear(5 * ch, 32),
+            nn.Linear(5 * num_channels, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Dropout(0.2),
         )
 
-        # 2. Per-channel CNN ----------------------------------------------
-        self.branches = nn.ModuleList([
-            nn.Sequential(
-                MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),      # 12 × 3 = 36
-                EnhancedResidualSEBlock(36, 48, 3, drop=0.3),
-                EnhancedResidualSEBlock(48, 48, 3, drop=0.3),
-            )
-            for _ in range(ch)
-        ])                         # 出力: (B, L', 48) × ch → 結合後 (B, L', 48*ch)
-
-        # 3-a. BiGRU / 3-b. BiLSTM / 3-c. LMU & Noise ----------------------
-        rnn_in = 48 * ch              # 720
-        self.bigru  = nn.GRU(rnn_in, 128, num_layers=2,
-                             batch_first=True, bidirectional=True, dropout=0.2)
-        self.bilstm = nn.LSTM(rnn_in, 128, num_layers=2,
-                              batch_first=True, bidirectional=True, dropout=0.2)
-        self.lmu    = LMU(rnn_in, hidden_size=128, memory_size=256, theta=127)
-        self.noise  = GaussianNoise(0.09)          # そのまま加算-正規化用
-
-        # rnn_cat のチャンネル数を計算
-        self.rnn_feat_dim = (128*2) + (128*2) + 128 + rnn_in   # 256+256+128+720 = 1360
-
-        # 4. Attention Pooling --------------------------------------------
-        self.attention_pool = AttentionLayer(self.rnn_feat_dim)  # → (B, 1360)
-
-        # 5. 分類ヘッド ----------------------------------------------------
-        in_feat = self.rnn_feat_dim + 32        # pooled + meta
-        self.classifier = nn.Sequential(
+        attn_ch = 1504
+        # 5. Prediction heads
+        in_feat = attn_ch + 32*2  + num_channels# pooled + meta
+        self.head = nn.Sequential(
             nn.Linear(in_feat, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(512, num_classes)         # 8-class logits
+            nn.Linear(512, num_classes),
         )
 
-    # ---------------- forward ----------------
+        self.rnn = rnn(num_channels, attn_ch=attn_ch)
+
+        self.mhsa = move_block(imu_ch=num_channels, n_heads=3)
+
+        self.attn_pooling = AttentionLayer(num_channels)
+
+
     def forward(self, x: torch.Tensor):
         """
-        x: (B, L, C=15)
+        x: (B, L, C)  – L=系列長, C=16ch
         """
-        # meta
-        meta        = self.meta_extractor(x)            # (B, 5*C)
-        meta_proj   = self.meta_dense(meta)             # (B, 32)
+        # ---------- meta ----------
+        x_1 = x[:, :self.len_move, :-1]
+        x_2 = x[:, self.len_move:, :-1]
+        phase = x[..., -1]
 
-        # CNN per-channel
-        branch_outs = []
-        for i in range(x.size(2)):
-            ci   = x[:, :, i].unsqueeze(1)              # (B,1,L)
-            out  = self.branches[i](ci)                 # (B, 48, L')
-            branch_outs.append(out.transpose(1, 2))     # (B, L', 48)
-        combined = torch.cat(branch_outs, dim=2)        # (B, L', 48*C)
+        meta_proj_1 = self.meta_dense(self.meta_extractor(x_1) )          # (B, 32)
+        meta_proj_2 = self.meta_dense(self.meta_extractor(x_2) )          # (B, 32)
 
-        # RNN + LMU
-        gru_out, _  = self.bigru(combined)              # (B, L', 256)
-        lstm_out, _ = self.bilstm(combined)             # (B, L', 256)
-        lmu_out, _  = self.lmu(combined)                # (B, L', 128)
-        noise_out   = self.noise(combined)              # (B, L', 720)
+        pooled = self.rnn(x[..., :-1])          
 
-        rnn_cat = torch.cat([gru_out, lstm_out, lmu_out, noise_out], dim=2)  # (B, L', 1360)
+        attn_1 = self.attn_pooling(self.mhsa(x_1))
+        #attn_2 = self.attn_pooling(self.mhsa(x_2))
 
-        # Attention pooling
-        pooled = self.attention_pool(rnn_cat)           # (B, 1360)
+        # ---------- Fuse & heads ----------
+        fused = torch.cat([pooled, meta_proj_1, meta_proj_2, attn_1], dim=1)  # (B,544)
+        z_cls = self.head(fused)
+        return z_cls
 
-        # Fuse & classify
-        fused  = torch.cat([pooled, meta_proj], dim=1)  # (B, 1392)
-        logits = self.classifier(fused)                 # (B, 8)
 
-        return logits          # ← CrossEntropyLoss にそのまま投入
+def _scan_lengths(df: pd.DataFrame):
+    '''
+    Scan all sequences and return (max_move_len, max_perform_len).
+    '''
+    len_move = 0
+    len_perform = 0
+
+    for _, seq in df.groupby('sequence_id'):
+        arr = seq['behavior_int'].to_numpy()
+
+        nz0 = np.argmax(arr != 0) if np.any(arr != 0) else len(arr)
+        len_move = max(len_move, nz0)
+
+        sub = arr[nz0:]
+        nz1 = np.argmax(sub != 1) if np.any(sub != 1) else len(sub)
+        len_perform = max(len_perform, nz1)
+
+    return len_move, len_perform
+
+
+class GestureSequence(Dataset):
+    """Lazy Sequence dataset returning (x, y_int)."""
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        scaler: StandardScaler,
+        feat_cols: List[str],
+        imu_idx: List[int],
+        len_move: int,
+        len_perform: int,
+    ) -> None:
+        super().__init__()
+        self.groups = list(df.groupby("sequence_id", sort=False))
+        self.scaler = scaler
+        self.feat_cols = feat_cols
+        self.imu_idx = imu_idx
+        self.len_move = len_move
+        self.len_perform = len_perform
+        self.F = len(feat_cols)
+
+    # ---- utils ----
+    def _pad(self, arr: np.ndarray, max_len: int) -> np.ndarray:
+        if arr.size == 0:
+            return np.zeros((max_len, self.F), np.float16)
+        if len(arr) >= max_len:
+            return arr[:max_len]
+        pad = np.repeat(arr[-1:], max_len - len(arr), axis=0)
+        return np.vstack([arr, pad])
+
+    # ---- dataset ----
+    def __len__(self) -> int:  # noqa: D401
+        return len(self.groups)
+
+    def __getitem__(self, idx):  # noqa: D401
+        _, seq = self.groups[idx]
+        y_int = int(seq["gesture_int"].iloc[0])
+        feat = seq[self.feat_cols].to_numpy()
+        feat = self.scaler.transform(feat).astype(np.float16)
+        phase = seq["behavior_int"].to_numpy(dtype=np.int8)
+        move = feat[phase == 0]
+        perf = feat[phase == 1]
+        x = np.concatenate([
+            self._pad(move, self.len_move),
+            self._pad(perf, self.len_perform),
+        ], axis=0)
+        phase_pad = np.concatenate([
+            np.zeros(self.len_move, np.int8),
+            np.ones(self.len_perform, np.int8),
+        ])[:, None]
+        x = np.concatenate([x, phase_pad], axis=1)  # (L, F+1)
+        x = x[:, self.imu_idx]
+        return torch.from_numpy(x), y_int
+
+# =====================================================
+# collate
+# =====================================================
+
+def collate_pad(batch):
+    xs, ys = zip(*batch)
+    max_len = max(x.shape[0] for x in xs)
+    xs_pad = []
+    for x in xs:
+        pad_len = max_len - x.shape[0]
+        if pad_len:
+            pad = x.new_full((pad_len, x.shape[1]), -1)
+            x = torch.cat([x, pad], 0)
+        xs_pad.append(x)
+    x_stack = torch.stack(xs_pad).float()
+    x_stack = torch.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
+    y_tensor = torch.tensor(ys, dtype=torch.long)
+    return x_stack, y_tensor
+# def make_collate_pad(alpha: float = 0.0):
+#     """Return collate that pads & (optionally) MixUp on int targets."""
+
+#     def _collate(batch):
+#         xs, ys = zip(*batch)
+#         max_len = max(x.shape[0] for x in xs)
+#         xs_pad = []
+#         for x in xs:
+#             pad_len = max_len - x.shape[0]
+#             if pad_len:
+#                 pad = x.new_full((pad_len, x.shape[1]), -1)
+#                 x = torch.cat([x, pad], 0)
+#             xs_pad.append(x)
+#         x_stack = torch.stack(xs_pad).float()
+#         x_stack = torch.nan_to_num(x_stack, nan=0.0, posinf=0.0, neginf=0.0)
+#         y_tensor = torch.tensor(ys, dtype=torch.long)
+
+#         if alpha > 0.0:
+#             lam = np.random.beta(alpha, alpha)
+#             perm = torch.randperm(x_stack.size(0))
+#             x_stack = lam * x_stack + (1 - lam) * x_stack[perm]
+#             # MixUp for CE: keep two indices + lambda
+#             return x_stack, y_tensor, y_tensor[perm], lam
+#         return x_stack, y_tensor
+
+#     return _collate
+
 

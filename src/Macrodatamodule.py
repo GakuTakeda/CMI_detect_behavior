@@ -1,4 +1,3 @@
-# datamodule_cv.py という新ファイルにすると分かりやすい
 import numpy as np, pandas as pd, torch, joblib, pathlib
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler, LabelEncoder

@@ -1,7 +1,7 @@
 # cv_main.py
 import hydra, lightning as L
 from omegaconf import DictConfig
-from datamodule import GestureDataModule
+from Macrodatamodule import GestureDataModule
 from lit_model     import LitModelVariantGRU
 import json
 import os
@@ -26,7 +26,7 @@ def run(cfg: DictConfig):
         dm.setup()
 
         model = LitModelVariantGRU(
-            num_classes=18,
+            num_classes=8,
             lr_init=cfg.train.lr_init,
             weight_decay=cfg.train.weight_decay,
             class_weight=dm.class_weight
@@ -65,7 +65,7 @@ def run(cfg: DictConfig):
 
             model = LitModelVariantGRU.load_from_checkpoint(
                     checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_imu_{fold+1}.ckpt"),
-                    num_classes=18,
+                    num_classes=8,
                     lr_init=cfg.train.lr_init,
                     weight_decay=cfg.train.weight_decay,
                     class_weight=dm.class_weight
@@ -87,9 +87,11 @@ def run(cfg: DictConfig):
                     submission.append(gesture_classes[idx])
                     solution.append(gesture_classes[true_idx])
 
+            np.save(dm.export_dir/f"fold{fold+1}submission.npy", submission)
+            np.save(dm.export_dir/f"fold{fold+1}solution.npy", solution)
+
             scores = {
-                f"binary_score_of_fold_{fold+1}_imu":      caluculate.binary_score(solution, submission),
-                f"macro_score_of_fold_{fold+1}_imu":      caluculate.macro_score(solution, submission),
+                f"macro_score_of_fold_{fold+1}_imu":      2*caluculate.macro_score(solution, submission),
             }
 
             with open(dm.export_dir / f"scores_{fold+1}.json", "w") as f:

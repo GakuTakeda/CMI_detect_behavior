@@ -10,6 +10,7 @@ device: cuda
 dense_drop: 0.2
 conv_drop: 0.2
 noise_std: 0.09
+fold: 0
 
 # Early stopping & 出力
 metric_name: val_loss
