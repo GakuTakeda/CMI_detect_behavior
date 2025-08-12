@@ -1,0 +1,16 @@
+batch_size: 128
+batch_size_val: 256
+epochs: 70
+lr_init: 1e-3
+weight_decay: 1e-4
+mixup_alpha: 0.2
+patience: 10
+t0_factor: 5            # CosineAnnealingWarmRestarts の T_0 係数
+device: cuda
+dense_drop: 0.2
+conv_drop: 0.2
+noise_std: 0.09
+fold: 0
+
+# Early stopping & 出力
+metric_name: val_loss
