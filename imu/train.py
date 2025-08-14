@@ -62,35 +62,42 @@ def run(cfg: DictConfig):
             allow_pickle=True
         )
         with torch.no_grad():
+            device = cfg.train.device
 
             model = litmodel.load_from_checkpoint(
-                    checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_imu_{fold+1}.ckpt"),
-                    cfg=cfg,
-                    num_classes=18,
-                    lr_init=cfg.train.lr_init,
-                    weight_decay=cfg.train.weight_decay,
-                    class_weight=dm.class_weight
-                )
-            model.eval()
-            model.to(cfg.train.device)
+                checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_imu_{fold+1}.ckpt"),
+                cfg=cfg,
+                num_classes=18,
+                lr_init=cfg.train.lr_init,
+                weight_decay=cfg.train.weight_decay,
+                class_weight=dm.class_weight,
+            )
+            model.eval().to(device)
 
-            submission = []
-            solution = []
+            submission, solution = [], []
             for batch in dm.val_dataloader_imu():
-                x, y = batch
-                x = x.to(cfg.train.device, non_blocking=True)
+                # 検証は通常 (x, lengths, mask, y)。万一 train 用 collate が来ても耐性を持たせる
+                if len(batch) == 4:
+                    x, lengths, mask, y = batch
+                elif len(batch) == 6:
+                    x, lengths, mask, y, _, _ = batch  # mixup の y_b/lam は無視
+                else:
+                    raise RuntimeError(f"Unexpected batch format: len={len(batch)}")
 
-                y_pred = model(x)
+                x = x.to(device, non_blocking=True)
+                lengths = lengths.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
 
-                for pred, y_true in zip(y_pred, y):
-                    idx = pred.argmax(dim=0).cpu().numpy()
-                    true_idx = y_true.argmax(dim=0).cpu().numpy()
-                    submission.append(gesture_classes[idx])
-                    solution.append(gesture_classes[true_idx])
+                logits = model(x, lengths, mask)              # [B, num_classes]
+                pred_ids = logits.argmax(dim=1).cpu().numpy() # 予測クラスID
+                true_ids = (y.argmax(dim=1).cpu().numpy() if y.ndim == 2 else y.cpu().numpy())
+
+                submission.extend([gesture_classes[i] for i in pred_ids])
+                solution.extend([gesture_classes[i] for i in true_ids])
 
             scores = {
-                f"binary_score_of_fold_{fold+1}_imu":      caluculate.binary_score(solution, submission),
-                f"macro_score_of_fold_{fold+1}_imu":      caluculate.macro_score(solution, submission),
+                f"binary_score_of_fold_{fold+1}_imu":  caluculate.binary_score(solution, submission),
+                f"macro_score_of_fold_{fold+1}_imu":   caluculate.macro_score(solution, submission),
             }
 
             with open(dm.export_dir / f"scores_{fold+1}.json", "w") as f:

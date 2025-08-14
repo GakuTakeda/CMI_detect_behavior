@@ -1,3 +1,4 @@
+
 model:
   name: lstmgru
   num_classes: 18
@@ -9,24 +10,19 @@ meta:
 
 cnn:
   multiscale:
-    out_channels: 36
-    out_per_kernel: 12        # 各カーネルあたりの出力チャネル
+    out_per_kernel: 12        # 12 × len([3,5,7]) = 36ch をコード側で算出
     kernel_sizes: [3, 5, 7]
   se:
     out_channels: 48          # 各チャンネル枝の最終出力チャネル
     drop: 0.30
+    
+  pool_sizes: [2, 2]        # MaxPool1d を2回通す想定 → L_out ≈ floor(L/4)
 
 rnn:
   hidden_size: 128
   num_layers: 2
   dropout: 0.20
   bidirectional: true
-
-lmu:
-  hidden_size: 128
-  memory_size: 256
-  theta: 127
-  out_size: 128               # LMUの時間方向出力次元（実装に合わせて変更可）
 
 noise:
   std: 0.09
