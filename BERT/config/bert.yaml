@@ -1,0 +1,42 @@
+data:
+  n_splits: 5
+  raw_dir: ../data
+  export_dir: output
+
+train:
+  batch_size: 128
+  batch_size_val: 128
+  mixup_alpha: 0.2
+  lr_init: 5e-4
+  min_lr: 2e-5
+  weight_decay: 3e-3
+  epochs: 150
+  warmup_epochs: 30
+  device: cuda
+  patience: 40
+
+seed: 42
+dim: None
+channels: 219
+num_classes: 18
+feat_dim: 500
+
+se1:
+  num_layers: 0
+  dropout: 0.3
+
+se2:
+  num_layers: 0
+  dropout: 0.3
+
+bert_layers: 8
+bert_heads: 10
+
+cls1:
+  channels: 937
+  dropout: 0.2
+
+cls2:
+  channels: 303
+  dropout: 0.2
+

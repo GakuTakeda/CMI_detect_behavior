@@ -178,7 +178,7 @@ def objective(trial, cfg) -> float:
 @hydra.main(config_path="config", config_name="config", version_base="1.3")
 def run(cfg: DictConfig):
     study = optuna.create_study(
-        study_name="imu_tuning_2",
+        study_name="imu_tuning_3",
         storage="sqlite:///lstmgru_tuning.db",
         load_if_exists=True,
         direction="maximize",
