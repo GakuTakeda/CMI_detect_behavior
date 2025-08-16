@@ -587,7 +587,7 @@ class litmodel(L.LightningModule):
         opt = self.optimizers()
         if opt is not None:
             log_dict["lr"] = opt.param_groups[0]["lr"]
-        self.log_dict(log_dict, on_step=True, on_epoch=True, prog_bar=True)
+        self.log_dict(log_dict, on_step=True, on_epoch=True)
         return loss
 
     # ------------------------------------------------------------
@@ -845,11 +845,9 @@ class GestureDataModule(L.LightningDataModule):
         sgkf = StratifiedGroupKFold(
             n_splits=self.n_splits, shuffle=True, random_state=self.cfg.seed
         )
-        # 必要に応じた層化変換（例: 一部クラスをまとめる）
-        y_processed = [(y if y < 8 else -1) for y in y_int] #ここがよくなかったりする？
 
         tr_idx, val_idx = list(
-            sgkf.split(np.arange(len(X_list)), y_processed, np.array(subjects))
+            sgkf.split(np.arange(len(X_list)), y_int, np.array(subjects))
         )[self.fold_idx]
 
         # ---- Dataset（可変長）----

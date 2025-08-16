@@ -7,14 +7,14 @@ import json
 import os
 import torch
 import numpy as np
-from utils import set_seed, calc_f1
+from utils import seed_everything, calc_f1
 
 @hydra.main(config_path="config", config_name="config", version_base="1.3")
 def run(cfg: DictConfig):
 
     caluculate = calc_f1()
 
-    set_seed(cfg.data.random_seed)
+    seed_everything(cfg.data.random_seed)
     n_splits = cfg.data.n_splits        # 例: 5
     for fold in range(n_splits):
         print(f"\n===== Fold {fold} / {n_splits-1} =====")

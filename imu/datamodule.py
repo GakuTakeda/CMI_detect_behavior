@@ -80,11 +80,10 @@ class GestureDataModule(L.LightningDataModule):
             shuffle=True,                
             random_state=self.cfg.data.random_seed
         )
-        y_processed = [(y if y < 8 else -1) for y in y_int]
 
         # fold_idx 番目を取得
         tr_idx, val_idx = list(
-            sgkf.split(X=np.arange(len(X_list)), y=y_processed, groups=np.array(subjects))
+            sgkf.split(X=np.arange(len(X_list)), y=y_int, groups=np.array(subjects))
         )[self.fold_idx]
 
 

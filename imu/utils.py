@@ -78,16 +78,6 @@ class calc_f1:
         return 0.5 * f1_macro
 
 
-def extract_seq(train, target):
-    train_df = train.copy()
-    list_ = []
-    for _, df in train_df.groupby("sequence_id"):
-        if df["gesture"].iloc[0] == target:
-            list_.append(df)
-    
-    return list_
-
-
 def labeling(value):
 
     BFRB = [
@@ -141,13 +131,28 @@ def labeling_for_macro(value):
             "Eyebrow - pull hair", "Eyelash - pull hair", "Neck - pinch skin",
             "Neck - scratch", "Cheek - pinch skin"]
 
-def set_seed(seed: int = 42):
+def seed_everything(seed: int = 42) -> None:
+    # ── Python & NumPy ──────────────────────────────
+    os.environ["PYTHONHASHSEED"] = str(seed)          # hash ランダム化の固定
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+
+    # ── PyTorch ─────────────────────────────────────
+    torch.manual_seed(seed)                           # CPU
+    torch.cuda.manual_seed(seed)                      # GPU (現在プロセス)
+    torch.cuda.manual_seed_all(seed)                  # GPU (全デバイス)
+
+    # アルゴリズムを完全に決定論的に
+    torch.use_deterministic_algorithms(True)
+
+    # CuDNN / TF32 設定
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.benchmark = False            # 入力形状による自動チューニングを無効化
+    torch.backends.cuda.matmul.allow_tf32 = False     # TF32 を無効化
+    torch.backends.cudnn.allow_tf32 = False
+
+    # CUBLAS のワークスペースを固定（torch インポート前に設定するのが安全）
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"   # または ":4096:8"
 # def remove_outliers(df: pd.DataFrame, threshold: int = 300) -> pd.DataFrame:
 #     df = df.copy()
 #     df_out = df.copy()

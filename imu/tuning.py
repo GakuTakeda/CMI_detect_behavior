@@ -11,7 +11,7 @@ import optuna
 from optuna.integration import PyTorchLightningPruningCallback
 
 from datamodule import GestureDataModule
-from utils import litmodel, set_seed, calc_f1
+from utils import litmodel, seed_everything, calc_f1
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -22,7 +22,7 @@ KS_CANDIDATES = {
 }
 def objective(trial, cfg) -> float:
     scorer = calc_f1()
-    set_seed(cfg.data.random_seed)
+    seed_everything(cfg.data.random_seed)
 
     cfg_trial = deepcopy(cfg)
 

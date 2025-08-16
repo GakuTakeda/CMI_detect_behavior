@@ -1,0 +1,49 @@
+data:
+  n_splits: 5
+  raw_dir: ../data
+  export_dir: output
+  random_seed: 42
+
+train:
+  batch_size: 128
+  batch_size_val: 128
+  mixup_alpha: 0.2
+  lr_init: 5e-4
+  min_lr: 2e-5
+  weight_decay: 3e-3
+  epochs: 150
+  warmup_epochs: 30
+  device: cuda
+  patience: 40
+
+imu_dim: None
+num_classes: None
+
+tof: #ここはあまり変えないほうがいいと思う
+  in_channels: 5
+  out_dim: 32
+
+cnn:
+  multiscale:
+    kernel_sizes: [3,5,7]
+    out_per_kernel: 12
+  residual:
+    out_channels: 48
+    num_blocks: 2
+  share_branch: false
+
+rnn:
+  hidden_size: 128
+  num_layers: 2
+  bidirectional: true
+  dropout: 0.2
+
+meta:
+  proj_dim: 64
+  dropout: 0.2
+
+noise_std: 0.09
+
+head:
+  hidden: 512
+  dropout: 0.5
