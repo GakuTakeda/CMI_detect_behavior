@@ -29,7 +29,7 @@ import math
 import pathlib
 from pathlib import Path
 from hydra.core.hydra_config import HydraConfig
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
@@ -87,88 +87,6 @@ class calc_f1:
         )
     
         return 0.5 * f1_macro
-
-
-def extract_seq(train, target):
-    train_df = train.copy()
-    list_ = []
-    for _, df in train_df.groupby("sequence_id"):
-        if df["gesture"].iloc[0] == target:
-            list_.append(df)
-    
-    return list_
-
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-
-def plot_behavior(seq):
-    seq = feature_eng(seq)
-
-    # ---------------- 行動→色 ----------------
-    behav_colors = {
-        "Relaxes and moves hand to target location": "#c0dffd",
-        "Moves hand to target location"            : "#c0dffd",
-        "Hand at target location"                  : "#c4f2c4",
-        "Performs gesture"                         : "#ffc8c8",
-    }
-
-    # ---------------- 変化点で区間抽出 ----------------
-    seg_id   = (seq["behavior"] != seq["behavior"].shift()).cumsum()
-    grouped  = seq.groupby(seg_id, sort=False)
-
-    # ---------------- プロット ----------------
-    # ←★ ここに列を追加するだけ★→
-    signals = [
-        ("acc_x",   "acceleration_X"),
-        ("acc_y",   "acceleration_Y"),
-        ("acc_z",   "acceleration_Z"),
-        ("acc_mag", "acceleration_magnitude"),
-        ("rot_x",   "rotation_X"),
-        ("rot_y",   "rotation_Y"),
-        ("rot_z",   "rotation_Z"),
-        ("rot_w",   "rotation_W"),
-        ("rot_angle", "rotation_angle"),
-    ]
-
-    # 軸を「signals の要素数」だけ作成
-    fig, axes = plt.subplots(len(signals), 1, figsize=(12, 2.2*len(signals)), sharex=True)
-
-    # ▲― signals と axes の数が一致するよう保証される
-    for ax, (col, label) in zip(axes, signals):
-        if col not in seq.columns:
-            ax.text(0.5, 0.5, f"'{col}' not found", ha="center", va="center", transform=ax.transAxes)
-            ax.set_ylabel(label)
-            continue
-
-        ax.plot(seq["sequence_counter"], seq[col], label=label)
-        ax.set_ylabel(label)
-
-    # ----------- 背景塗り -----------
-    legend_patches = []
-    seen_behaviors = set()
-
-    for _, segment in grouped:
-        behav = segment["behavior"].iloc[0]
-        if behav not in behav_colors:
-            continue
-        x0 = segment["sequence_counter"].iloc[0]
-        x1 = segment["sequence_counter"].iloc[-1]
-
-        for ax in axes:
-            ax.axvspan(x0, x1, color=behav_colors[behav], alpha=0.25, linewidth=0)
-
-        if behav not in seen_behaviors:
-            legend_patches.append(mpatches.Patch(color=behav_colors[behav],
-                                                 alpha=0.25, label=behav))
-            seen_behaviors.add(behav)
-
-    axes[0].legend(handles=legend_patches, loc="upper right", fontsize=8)
-    axes[-1].set_xlabel("sequence_counter")
-
-    plt.tight_layout()
-    plt.show()
-
 
 def labeling(value):
 
@@ -960,6 +878,7 @@ class litmodel(L.LightningModule):
               (x_imu, x_tof, lengths, mask, y)
         """
         b = self._parse_batch(batch)
+        bs = b["x_imu"].size(0)
 
         if b["is_mixup"]:
             logits = self.forward(b["x_imu"], b["x_tof"], b["lengths"], b["mask"])
@@ -981,12 +900,13 @@ class litmodel(L.LightningModule):
         opt = self.optimizers()
         if opt is not None:
             log_dict["lr"] = opt.param_groups[0]["lr"]
-        self.log_dict(log_dict, on_step=True, on_epoch=True)
+        self.log_dict(log_dict, on_step=True, on_epoch=True, batch_size=bs)
         return loss
 
     # ------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
         b = self._parse_batch(batch)
+        bs = b["x_imu"].size(0)
         # 検証では mixup を使わず、y を見る（ダミーがあっても無視）
         if b["y"] is None:
             raise RuntimeError("Validation step requires labels in the batch.")
@@ -994,15 +914,16 @@ class litmodel(L.LightningModule):
         loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
         preds  = logits.argmax(dim=1)
         acc    = self._acc(preds, b["y"])
-        self.log_dict({"val/loss": loss, "val/acc": acc}, on_step=False, on_epoch=True, prog_bar=True)
+        self.log_dict({"val/loss": loss, "val/acc": acc}, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs)
 
     def test_step(self, batch, batch_idx):
         b = self._parse_batch(batch)
+        bs = b["x_imu"].size(0)
         if b["y"] is None:
             raise RuntimeError("Test step requires labels in the batch.")
         logits = self.forward(b["x_imu"], b["x_tof"], b["lengths"], b["mask"])
         loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
-        self.log_dict({"test/loss": loss}, on_step=False, on_epoch=True)
+        self.log_dict({"test/loss": loss}, on_step=False, on_epoch=True, batch_size=bs)
 
     # ------------------------------------------------------------
     # Optimizer: AdamW + Warmup(epochs指定) → Cosine（min_lr下限）を step 更新
@@ -1308,13 +1229,13 @@ class GestureDataModule(L.LightningDataModule):
         y_int = np.array(y_list, dtype=np.int64)
 
         # ---- StratifiedGroupKFold ----
-        sgkf = StratifiedGroupKFold(
+        skf = StratifiedKFold(
             n_splits=self.n_splits,
             shuffle=True,
             random_state=self.cfg.data.random_seed
         )
         groups = np.array(subjects)
-        tr_idx, val_idx = list(sgkf.split(np.arange(len(X_imu_list)), y_int, groups))[self.fold_idx]
+        tr_idx, val_idx = list(skf.split(np.arange(len(X_imu_list)), y_int))[self.fold_idx]
 
         # ---- Dataset ----
         X_imu_tr = [X_imu_list[i] for i in tr_idx]

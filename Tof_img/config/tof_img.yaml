@@ -8,8 +8,8 @@ train:
   batch_size: 128
   batch_size_val: 128
   mixup_alpha: 0.2
-  lr_init: 5e-4
-  min_lr: 2e-5
+  lr_init: 1e-4
+  min_lr: 1e-6
   weight_decay: 3e-3
   epochs: 150
   warmup_epochs: 30
