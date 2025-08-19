@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import torch
 import torch.nn as nn
@@ -322,215 +323,6 @@ def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
-class SEBlock(nn.Module):
-    def __init__(self, channels, reduction=8):
-        super().__init__()
-        self.pool = nn.AdaptiveAvgPool1d(1)           # GlobalAveragePooling1D
-        self.fc1  = nn.Linear(channels, channels // reduction)
-        self.fc2  = nn.Linear(channels // reduction, channels)
-
-    def forward(self, x):                             # x: (N, C, L)
-        z = self.pool(x).squeeze(-1)                  # (N, C)
-        z = F.relu(self.fc1(z))
-        z = torch.sigmoid(self.fc2(z))                # (N, C)
-        z = z.unsqueeze(-1)                           # (N, C,1)
-        return x * z                                  # channel-wise 補正
-
-
-class ResidualSEBlock(nn.Module):
-    """
-    2×Conv1D + BN + ReLU → SE → Add → ReLU → MaxPool → Dropout
-    """
-    def __init__(self, in_ch, out_ch,
-                 k=3, pool_size=2, drop=0.3, wd=1e-4):
-        super().__init__()
-        pad = k // 2
-        self.conv1 = nn.Conv1d(in_ch, out_ch, k, padding=pad,
-                               bias=False, padding_mode='zeros')
-        self.bn1   = nn.BatchNorm1d(out_ch)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, k, padding=pad,
-                               bias=False, padding_mode='zeros')
-        self.bn2   = nn.BatchNorm1d(out_ch)
-
-        # Shortcut のチャネル数調整
-        self.shortcut = nn.Conv1d(in_ch, out_ch, 1, bias=False) \
-                        if in_ch != out_ch else nn.Identity()
-        self.bn_sc = nn.BatchNorm1d(out_ch) if in_ch != out_ch else nn.Identity()
-
-        self.se     = SEBlock(out_ch)
-        self.pool   = nn.MaxPool1d(pool_size)
-        self.drop   = nn.Dropout(drop)
-        self.weight_decay = wd   # ⇒ Optimizer で weight_decay に設定
-
-    def forward(self, x):                    # x: (N, C_in, L)
-        residual = self.bn_sc(self.shortcut(x))
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.se(out)
-        out = F.relu(out + residual)
-        out = self.pool(out)
-        out = self.drop(out)
-        return out                           # (N, C_out, L')
-    
-def down_len(lengths: torch.Tensor, pool_sizes: Sequence[int]) -> torch.Tensor:
-    """Conv後に現れる各 MaxPool1d の pool_size を順に適用して長さを更新"""
-    l = lengths.clone()
-    for p in pool_sizes:
-        l = torch.div(l, p, rounding_mode="floor")
-    return l.clamp_min(1)
-
-class AttentionLayer(nn.Module):
-    """マスク対応のシンプルなアテンションプーリング"""
-    def __init__(self, in_dim: int, hidden: int = 128):
-        super().__init__()
-        self.w = nn.Linear(in_dim, hidden, bias=False)
-        self.v = nn.Linear(hidden, 1, bias=False)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        x: [B,T,D], mask: [B,T] (True=有効). Noneなら全有効
-        return: [B,D]
-        """
-        s = self.v(torch.tanh(self.w(x))).squeeze(-1)   # [B,T]
-        if mask is not None:
-            s = s.masked_fill(~mask, -1e9)
-        w = s.softmax(dim=1)                            # [B,T]
-        pooled = torch.bmm(w.unsqueeze(1), x).squeeze(1)  # [B,D]
-        return pooled
-
-
-class MultiScaleConv1d(nn.Module):
-    """Multi-scale temporal convolution block (長さ保存: stride=1, SAME padding相当)"""
-    def __init__(self, in_channels, out_per_kernel, kernel_sizes=[3, 5, 7]):
-        super().__init__()
-        self.kernel_sizes = kernel_sizes
-        self.convs = nn.ModuleList()
-        for ks in kernel_sizes:
-            pad = ks // 2  # 奇数カーネル推奨（長さ保存）
-            self.convs.append(nn.Sequential(
-                nn.Conv1d(in_channels, out_per_kernel, ks, padding=pad, bias=False),
-                nn.BatchNorm1d(out_per_kernel),
-                nn.ReLU(inplace=True)
-            ))
-
-    @property
-    def out_channels(self):
-        # 合計出力チャネル
-        return sum(block[0].out_channels for block in self.convs)
-
-    def forward(self, x):
-        outputs = [conv(x) for conv in self.convs]  # list of [N, out_per_kernel, L]
-        return torch.cat(outputs, dim=1)            # [N, out_per_kernel*K, L]
-
-
-class EnhancedSEBlock(nn.Module):
-    """Avg/Maxの両方でSE"""
-    def __init__(self, channels, reduction=8):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.max_pool = nn.AdaptiveMaxPool1d(1)
-        self.excitation = nn.Sequential(
-            nn.Linear(channels * 2, channels // reduction, bias=False),
-            nn.SiLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _ = x.size()
-        avg_y = self.avg_pool(x).view(b, c)
-        max_y = self.max_pool(x).view(b, c)
-        y = torch.cat([avg_y, max_y], dim=1)
-        y = self.excitation(y).view(b, c, 1)
-        return x * y.expand_as(x)
-
-
-class EnhancedResidualSEBlock(nn.Module):
-    """
-    (Conv-BN-ReLU)×2 → SE → Add → ReLU → MaxPool → Dropout
-    出力長: floor(L_in / pool_size)
-    """
-    def __init__(self, in_ch, out_ch, k=3, pool_size=2, drop=0.3):
-        super().__init__()
-        pad = k // 2
-        self.conv1 = nn.Conv1d(in_ch, out_ch, k, padding=pad, bias=False)
-        self.bn1   = nn.BatchNorm1d(out_ch)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, k, padding=pad, bias=False)
-        self.bn2   = nn.BatchNorm1d(out_ch)
-
-        self.shortcut = nn.Conv1d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
-        self.bn_sc = nn.BatchNorm1d(out_ch) if in_ch != out_ch else nn.Identity()
-
-        self.se     = EnhancedSEBlock(out_ch)
-        self.pool   = nn.MaxPool1d(pool_size)  # stride=pool_size
-        self.drop   = nn.Dropout(drop)
-        self.pool_size = pool_size
-
-    def forward(self, x):                 # x: (N, C_in, L)
-        residual = self.bn_sc(self.shortcut(x))
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.se(out)
-        out = F.relu(out + residual)
-        out = self.pool(out)
-        out = self.drop(out)
-        return out                        # (N, C_out, floor(L/p))
-
-
-class MetaFeatureExtractor(nn.Module):
-    """
-    時系列マスク付きの簡易メタ特徴 (各Ch 5個: mean, std, min, max, abs-mean)
-    入力: x[B,T,C], mask[B,T]
-    出力: [B, 5*C]
-    """
-    def __init__(self, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, T, C = x.shape
-        if mask is None:
-            valid = torch.ones(B, T, dtype=torch.bool, device=x.device)
-        else:
-            valid = mask
-
-        # [B,T,1] に拡張
-        m = valid.unsqueeze(-1)  # True=有効
-        cnt = m.sum(dim=1).clamp_min(1)  # [B,1]
-
-        xm = x * m  # 無効部は0
-
-        mean = xm.sum(dim=1) / cnt
-        var = ( (xm - mean.unsqueeze(1)) * m ).pow(2).sum(dim=1) / cnt
-        std = torch.sqrt(var + self.eps)
-
-        # min/max は無効部を +inf/-inf にする
-        x_min = x.masked_fill(~m, float('inf')).min(dim=1).values
-        x_max = x.masked_fill(~m, float('-inf')).max(dim=1).values
-        abs_mean = xm.abs().sum(dim=1) / cnt
-
-        feats = torch.cat([mean, std, x_min, x_max, abs_mean], dim=1)  # [B, 5*C]
-        return feats
-
-def preprocess_sequence(
-        df_seq: pd.DataFrame,
-        feature_cols: list[str],
-        scaler: StandardScaler
-) -> torch.Tensor:
-    """
-    • 欠損を ffill/bfill → 0 埋め
-    • StandardScaler.transform → float32
-    • torch.tensor に変換して返す  (shape: [T, C])
-    """
-    mat = (
-        df_seq[feature_cols]
-        .ffill().bfill().fillna(0)
-        .values                                # ndarray
-    )
-    mat = scaler.transform(mat).astype("float32")
-    return torch.from_numpy(mat)      
-
     
 class SequenceDataset_for_tof(Dataset):
     """
@@ -569,27 +361,6 @@ def mixup_collate_fn(alpha: float = 0.2):
         return X_mix,img_mix, y_mix
 
     return _collate
-
-def _pad(mat: np.ndarray, pad_len: int) -> np.ndarray:
-    F = mat.shape[1]
-    out = np.zeros((pad_len, F), dtype='float32')
-    seq_len = min(len(mat), pad_len)
-    out[:seq_len] = mat[:seq_len]
-    return out
-
-
-class GaussianNoise(nn.Module):
-    def __init__(self, stddev=0.1):
-        super().__init__()
-        self.stddev = stddev
-
-    def forward(self, x):
-        if self.training and self.stddev > 0:
-            noise = torch.randn_like(x) * self.stddev
-            return x + noise
-        return x
-    
-    
 class TinyCNN(nn.Module):
     def __init__(self, in_channels=5, out_dim=32):
         super().__init__()
@@ -605,177 +376,246 @@ class TinyCNN(nn.Module):
     def forward(self,x):
         x = self.net(x)
         return x.view(x.size(0), -1)
-    
+
+# ========= その他のサブモジュール（そのまま） =========
+class MultiScaleConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_sizes=[3,5,7]):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, k, padding=k//2),
+                nn.BatchNorm1d(out_channels),
+                nn.ReLU()
+            ) for k in kernel_sizes
+        ])
+    def forward(self, x):
+        return torch.cat([conv(x) for conv in self.convs], dim=1)
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        b,c,_ = x.size()
+        y = self.pool(x).view(b,c)
+        y = self.fc(y).view(b,c,1)
+        return x * y
+
+class ResidualSEBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, pool_size=2, drop=0.3):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_ch, out_ch, k, padding=k//2)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, k, padding=k//2)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+        self.shortcut = nn.Conv1d(in_ch, out_ch, 1) if in_ch!=out_ch else nn.Identity()
+        self.bn_sc = nn.BatchNorm1d(out_ch) if in_ch!=out_ch else nn.Identity()
+        self.se = SEBlock(out_ch)
+        self.pool = nn.MaxPool1d(pool_size)
+        self.drop = nn.Dropout(drop)
+    def forward(self, x):
+        res = self.bn_sc(self.shortcut(x))
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.se(x)
+        x = F.relu(x + res)
+        x = self.pool(x)
+        return self.drop(x)
+
+class AttentionLayer(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.fc = nn.Linear(d_model,1)
+    def forward(self, x):
+        score = torch.tanh(self.fc(x)).squeeze(-1)
+        weights = F.softmax(score, dim=1).unsqueeze(-1)
+        return (x*weights).sum(dim=1)
+
+class MetaFeatureExtractor(nn.Module):
+    def forward(self,x):
+        mean = x.mean(dim=1)
+        std = x.std(dim=1)
+        maxv,_ = x.max(dim=1)
+        minv,_ = x.min(dim=1)
+        slope = (x[:,-1,:] - x[:,0,:]) / max(x.size(1)-1,1)
+        return torch.cat([mean,std,maxv,minv,slope],dim=1)
+
+class GaussianNoise(nn.Module):
+    def __init__(self, stddev=0.09):
+        super().__init__()
+        self.stddev = stddev
+    def forward(self,x):
+        if self.training:
+            return x + torch.randn_like(x) * self.stddev
+        return x
+
+
 class ModelVariant_LSTMGRU_TinyCNN(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.imu_dim     = cfg.imu_dim
-        self.num_classes = cfg.num_classes
 
-        # ---- ToF branch ----
+        # ===== 必須パラメータ =====
+        assert cfg.imu_dim is not None and cfg.num_classes is not None, \
+            "cfg.imu_dim と cfg.num_classes を設定してください。"
+        self.imu_dim      = cfg.imu_dim
+        self.num_classes  = cfg.num_classes
+
+        # ===== TOF =====
         self.tof_in_ch   = cfg.tof.in_channels
         self.tof_out_dim = cfg.tof.out_dim
-        self.tof_cnn     = TinyCNN(in_channels=self.tof_in_ch, out_dim=self.tof_out_dim)
 
-        # ---- IMU per-channel CNN ----
-        ks   = cfg.cnn.multiscale.kernel_sizes
-        opk  = cfg.cnn.multiscale.out_per_kernel
-        ms_out = opk * len(ks)  # MultiScaleConv1d 出力チャネル
-        res_out = cfg.cnn.residual.out_channels
-        n_blocks = cfg.cnn.residual.num_blocks
-        share_branch = cfg.cnn.share_branch
+        # ===== CNN(IMU) =====
+        ksz               = cfg.cnn.multiscale.kernel_sizes        # 例 [3,5,7]
+        out_per_kernel    = cfg.cnn.multiscale.out_per_kernel      # 例 12
+        self.ms_in_ch     = 1                                      # IMUは各軸を1ch入力
+        self.ms_total_out = len(ksz) * out_per_kernel              # 例 3*12=36
 
-        def make_branch():
-            blocks = [
-                MultiScaleConv1d(1, opk, kernel_sizes=ks),     # [B, ms_out, T]
-                ResidualSEBlock(ms_out, res_out),
-            ]
-            for _ in range(n_blocks - 1):
-                blocks.append(ResidualSEBlock(res_out, res_out))
-            return nn.Sequential(*blocks)
+        self.imu_c_mid    = cfg.cnn.residual.out_channels          # 例 48
+        self.res_blocks   = cfg.cnn.residual.num_blocks            # 例 2
+        self.share_branch = cfg.cnn.share_branch                   # True で全IMU軸で重み共有
 
-        if share_branch:
-            shared = make_branch()
-            self.imu_branches = nn.ModuleList([shared for _ in range(self.imu_dim)])
+        # ===== RNN / Noise =====
+        self.rnn_hidden   = cfg.rnn.hidden_size
+        self.rnn_layers   = cfg.rnn.num_layers
+        self.rnn_bidir    = cfg.rnn.bidirectional
+        self.rnn_dropout  = cfg.rnn.dropout
+        self.noise_std    = cfg.noise_std
+
+        # ===== Meta =====
+        self.meta_stats_per_ch = getattr(cfg.meta, "stats_per_channel", 5)  # 既定5
+        self.meta_hidden       = cfg.meta.proj_dim
+        self.meta_dropout      = cfg.meta.dropout
+
+        # ===== Head =====
+        self.head_hidden  = cfg.head.hidden
+        self.head_dropout = cfg.head.dropout
+
+        # ===== IMU branch (作成関数) =====
+        def make_imu_branch():
+            layers = [MultiScaleConv1d(self.ms_in_ch, out_per_kernel)]  # 例: 1→(3*12)=36
+            # 最初の Residual は 36→48、その後は 48→48 を (num_blocks-1) 回
+            layers.append(ResidualSEBlock(self.ms_total_out, self.imu_c_mid))
+            for _ in range(self.res_blocks - 1):
+                layers.append(ResidualSEBlock(self.imu_c_mid, self.imu_c_mid))
+            return nn.Sequential(*layers)
+
+        if self.share_branch:
+            self.imu_branch_shared = make_imu_branch()
+            self.imu_branches = None
         else:
-            self.imu_branches = nn.ModuleList([make_branch() for _ in range(self.imu_dim)])
+            self.imu_branches = nn.ModuleList([make_imu_branch() for _ in range(self.imu_dim)])
+            self.imu_branch_shared = None
 
-        # ---- Meta ----
+        # ===== TOF branch =====
+        self.tof_cnn = TinyCNN(in_channels=self.tof_in_ch, out_dim=self.tof_out_dim)
+
+        # ===== Meta feature =====
         self.meta = MetaFeatureExtractor()
-        self.meta_proj = cfg.meta.proj_dim
+        meta_in = self.meta_stats_per_ch * (self.imu_dim + self.tof_out_dim)
         self.meta_dense = nn.Sequential(
-            nn.Linear(5 * (self.imu_dim + self.tof_out_dim), self.meta_proj),
-            nn.BatchNorm1d(self.meta_proj),
+            nn.Linear(meta_in, self.meta_hidden),
+            nn.BatchNorm1d(self.meta_hidden),
             nn.ReLU(),
-            nn.Dropout(cfg.meta.dropout),
+            nn.Dropout(self.meta_dropout),
         )
 
-        # ---- Sequence encoders (GRU/LSTM) ----
-        enc_in = res_out * self.imu_dim + self.tof_out_dim
-        self.rnn_hidden = cfg.rnn.hidden_size
-        self.rnn_layers = cfg.rnn.num_layers
-        self.rnn_bi     = cfg.rnn.bidirectional # bool
-        self.rnn_drop   = cfg.rnn.dropout
-        bi = 2 if self.rnn_bi else 1
-
+        # ===== Sequence encoders =====
+        fused_feat_dim = self.imu_c_mid * self.imu_dim + self.tof_out_dim
         self.bigru  = nn.GRU(
-            enc_in, self.rnn_hidden, batch_first=True,
-            bidirectional=self.rnn_bi, num_layers=self.rnn_layers, dropout=self.rnn_drop
+            fused_feat_dim, self.rnn_hidden,
+            batch_first=True, bidirectional=self.rnn_bidir,
+            num_layers=self.rnn_layers, dropout=self.rnn_dropout
         )
         self.bilstm = nn.LSTM(
-            enc_in, self.rnn_hidden, batch_first=True,
-            bidirectional=self.rnn_bi, num_layers=self.rnn_layers, dropout=self.rnn_drop
+            fused_feat_dim, self.rnn_hidden,
+            batch_first=True, bidirectional=self.rnn_bidir,
+            num_layers=self.rnn_layers, dropout=self.rnn_dropout
         )
+        self.noise  = GaussianNoise(self.noise_std)
 
-        # ---- Noise ----
-        self.noise = GaussianNoise(cfg.noise_std)
+        # ===== Attention + Head =====
+        concat_dim = (self.rnn_hidden * (2 if self.rnn_bidir else 1)) \
+                   + (self.rnn_hidden * (2 if self.rnn_bidir else 1)) \
+                   + fused_feat_dim
+        self.attn = AttentionLayer(concat_dim)
 
-        # ---- Attention + Head ----
-        gru_dim  = self.rnn_hidden * bi
-        lstm_dim = self.rnn_hidden * bi
-        concat_dim = gru_dim + lstm_dim + enc_in
-        self.attn = AttentionLayer(concat_dim)  # mask対応実装を想定（attn(x, mask=...)）
-
-        head_hidden = cfg.head.hidden
-        head_drop   = cfg.head.dropout
-        head_in     = concat_dim + (self.meta_proj)
-
+        head_in = concat_dim + self.meta_hidden
         self.head = nn.Sequential(
-            nn.Linear(head_in, head_hidden),
-            nn.BatchNorm1d(head_hidden),
+            nn.Linear(head_in, self.head_hidden),
+            nn.BatchNorm1d(self.head_hidden),
             nn.ReLU(),
-            nn.Dropout(head_drop),
-            nn.Linear(head_hidden, self.num_classes),
+            nn.Dropout(self.head_dropout),
+            nn.Linear(self.head_hidden, self.num_classes),
         )
 
-    # ---------- helpers ----------
-    @staticmethod
-    def _ensure_mask(B: int, T: int, lengths: Optional[torch.Tensor], mask: Optional[torch.Tensor], device) -> torch.Tensor:
-        if mask is not None:
-            return mask.to(device=device, dtype=torch.bool)
-        if lengths is not None:
-            ar = torch.arange(T, device=device)[None, :].expand(B, T)
-            return (ar < lengths[:, None])
-        return torch.ones(B, T, dtype=torch.bool, device=device)
+    def forward(self, x_imu, x_tof):
+        """
+        x_imu: (B, T, imu_dim)
+        x_tof: (B, T, C, H, W)
+        """
+        B, T, _ = x_imu.shape
 
-    @staticmethod
-    def _resample_mask(mask: torch.Tensor, target_len: int) -> torch.Tensor:
-        if mask.size(1) == target_len:
-            return mask
-        x = mask.float().unsqueeze(1)                           # [B,1,T]
-        x = F.adaptive_max_pool1d(x, output_size=target_len)    # [B,1,target_len]
-        return (x.squeeze(1) > 0.5)
-
-    def _meta_forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # MetaFeatureExtractor のシグネチャ差異に安全対応
-        try:
-            return self.meta(x, mask) if mask is not None else self.meta(x)
-        except TypeError:
-            return self.meta(x)
-
-    # ---------- forward ----------
-    def forward(
-        self,
-        x_imu: torch.Tensor,            # [B,T,C_imu]
-        x_tof: torch.Tensor,            # [B,T,C_tof,H,W]
-        lengths: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, T, C_imu = x_imu.shape
-        device = x_imu.device
-
-        # mask 準備
-        mask_in = self._ensure_mask(B, T, lengths, mask, device)         # [B,T]
-
-        # --- IMU per-channel CNN ---
+        # ===== IMU branch =====
         imu_feats = []
-        for i in range(C_imu):
-            xi = x_imu[:, :, i].unsqueeze(1)            # [B,1,T]
-            fi = self.imu_branches[i](xi)               # [B,res_out,T]
-            imu_feats.append(fi.transpose(1, 2))        # -> [B,T,res_out]
-        imu_feat = torch.cat(imu_feats, dim=2)          # [B,T,res_out*C_imu]
-        T_imu = imu_feat.size(1)
-        mask_imu = self._resample_mask(mask_in, T_imu)  # [B,T_imu]
+        for i in range(self.imu_dim):
+            xi = x_imu[:, :, i].unsqueeze(1)            # (B,1,T)
+            if self.share_branch:
+                fi = self.imu_branch_shared(xi)         # (B,C,T)
+            else:
+                fi = self.imu_branches[i](xi)           # (B,C,T)
+            imu_feats.append(fi.transpose(1, 2))         # (B,T,C)
+        imu_feat = torch.cat(imu_feats, dim=2)           # (B,T, 48*imu_dim)
 
-        # --- ToF CNN ---
-        B, T_tof, C, H, W = x_tof.shape
-        assert C == self.tof_in_ch, f"ToF channels mismatch: got {C}, expected {self.tof_in_ch}"
-        tof_flat = x_tof.view(B*T_tof, C, H, W)         # [B*T,C,H,W]
-        tof_vec  = self.tof_cnn(tof_flat)               # [B*T,tof_out_dim]
-        tof_feats = tof_vec.view(B, T_tof, -1)          # [B,T_tof,tof_out_dim]
+        # ===== TOF branch =====
+        B, T, C, H, W = x_tof.shape
+        tof_flat  = x_tof.view(B*T, C, H, W)
+        tof_feats = self.tof_cnn(tof_flat).view(B, T, -1)  # (B,T,tof_out_dim)
+
         # 時間長合わせ
-        tof_feats = F.adaptive_avg_pool1d(tof_feats.transpose(1, 2), output_size=T_imu).transpose(1, 2)  # [B,T_imu,tof_out_dim]
-        mask_tof  = self._resample_mask(mask_in, T_imu)                                                  # [B,T_imu]
+        tof_feats = F.adaptive_avg_pool1d(tof_feats.transpose(1, 2), output_size=imu_feat.size(1)).transpose(1, 2)
 
-        meta_imu = self._meta_forward(x_imu, mask_in)     # [B,5*C_imu]
-        meta_tof = self._meta_forward(tof_feats, mask_tof)# [B,5*tof_out_dim]
-        meta_vec = torch.cat([meta_imu, meta_tof], dim=1) # [B, 5*(C_imu+tof_out_dim)]
-        meta_vec = self.meta_dense(meta_vec)               # [B, meta_proj]
+        # ===== Meta =====
+        meta_imu = self.meta(x_imu)       # (B, stats_per_ch * imu_dim)
+        meta_tof = self.meta(tof_feats)   # (B, stats_per_ch * tof_out_dim)
+        meta = torch.cat([meta_imu, meta_tof], dim=1)
+        meta = self.meta_dense(meta)      # (B, meta_hidden)
 
-        # --- Sequence fusion & RNN（pack）---
-        seq = torch.cat([imu_feat, tof_feats], dim=2)         # [B,T_imu, enc_in]
-        enc_in = seq.size(2)
+        # ===== Sequence fusion & encoders =====
+        seq  = torch.cat([imu_feat, tof_feats], dim=2)   # (B,T,fused_feat_dim)
+        gru, _  = self.bigru(seq)                        # (B,T,hid*(1/2))
+        lstm, _ = self.bilstm(seq)                       # (B,T,hid*(1/2))
+        noise   = self.noise(seq)                        # (B,T,fused_feat_dim)
 
-        lengths_enc = mask_imu.logical_or(mask_tof).sum(dim=1).to(torch.long)
-        lengths_enc = torch.clamp(lengths_enc, min=1)
+        x = torch.cat([gru, lstm, noise], dim=2)         # (B,T,concat_dim)
+        x = self.attn(x)                                 # (B,concat_dim)
+        x = torch.cat([x, meta], dim=1)                  # (B,concat_dim+meta_hidden)
+        return self.head(x)                              # (B,num_classes)
 
-        packed = pack_padded_sequence(seq, lengths=lengths_enc.cpu(), batch_first=True, enforce_sorted=False)
-        gru_packed, _  = self.bigru(packed)
-        lstm_packed, _ = self.bilstm(packed)
-        gru_out, _  = pad_packed_sequence(gru_packed,  batch_first=True, total_length=T_imu)  # [B,T_imu,2H]
-        lstm_out, _ = pad_packed_sequence(lstm_packed, batch_first=True, total_length=T_imu)  # [B,T_imu,2H]
 
-        noise_out = self.noise(seq)   # [B,T_imu,enc_in]
+class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_epochs, total_epochs, base_lr, final_lr=2e-5, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.base_lr = base_lr
+        self.final_lr = final_lr
+        super(WarmupCosineScheduler, self).__init__(optimizer, last_epoch)
 
-        x = torch.cat([gru_out, lstm_out, noise_out], dim=2)         # [B,T_imu, 2H+2H+enc_in]
-        mask_enc = mask_imu.logical_or(mask_tof)                     # [B,T_imu]
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            return [self.base_lr * (self.last_epoch + 1) / self.warmup_epochs for _ in self.optimizer.param_groups]
+        else:
+            decay_epoch = self.last_epoch - self.warmup_epochs
+            decay_total = self.total_epochs - self.warmup_epochs
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * decay_epoch / decay_total))
+            return [self.final_lr + (self.base_lr - self.final_lr) * cosine_decay for _ in self.optimizer.param_groups]
 
-        # --- Attention (mask-aware) + Head ---
-        x = self.attn(x, mask=mask_enc)                              # [B, 2H+2H+enc_in]
-        x = torch.cat([x, meta_vec], dim=1)                      # [B, ...+meta_proj]
-        out = self.head(x)                                           # [B,num_classes]
-        return out
 
 class litmodel(L.LightningModule):
     def __init__(
@@ -803,19 +643,12 @@ class litmodel(L.LightningModule):
         else:
             self.class_weight = None
 
-        # optional regression（残置）
         self.mse = nn.MSELoss()
 
     # ------------------------------------------------------------
-    def forward(
-        self,
-        x_imu: torch.Tensor,
-        x_tof: torch.Tensor,
-        lengths: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, x_imu: torch.Tensor, x_tof: torch.Tensor) -> torch.Tensor:
         """x_imu: [B,T,C_imu], x_tof: [B,T,C_toF,H,W]"""
-        return self.model(x_imu, x_tof, lengths, mask)  # -> logits
+        return self.model(x_imu, x_tof)  # -> logits
 
     # ---- CE（hard/soft両対応） ----
     def _ce(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -828,7 +661,7 @@ class litmodel(L.LightningModule):
         ce = nn.CrossEntropyLoss(weight=self.class_weight)
         return ce(logits, hard)
 
-    # ---- accuracy（形式に自動対応） ----
+    # ---- accuracy ----
     def _acc(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         hard = target if target.ndim == 1 else target.argmax(dim=1)
         return self.train_acc(preds, hard) if self.training else self.val_acc(preds, hard)
@@ -837,65 +670,41 @@ class litmodel(L.LightningModule):
     @staticmethod
     def _parse_batch(batch: Union[Tuple, list]):
         """
-        サポートする形式（いずれも lengths, mask は可変長対応用）:
-        - (x_imu, x_tof, lengths, mask, y)                      -> 標準
-        - (x_imu, x_tof, lengths, mask, y, _, _)                -> 標準（ダミー2要素付き）
-        - (x_imu, x_tof, lengths, mask, y_a, y_b, lam)          -> mixup（hard）
-        - (x_imu, x_tof, lengths, mask)                         -> 推論等（y なし）
+        サポートする形式:
+        - (x_imu, x_tof, y)                 -> 通常（collate_pad_tof）
+        - (x_imu, x_tof, y_a, y_b, lam)     -> mixup（mixup_pad_collate_fn_tof）
         """
         if not isinstance(batch, (tuple, list)):
             raise RuntimeError(f"Unexpected batch type: {type(batch)}")
 
         n = len(batch)
-        if n == 7:
-            x_imu, x_tof, lengths, mask, y_a, y_b, lam = batch
-            return dict(x_imu=x_imu, x_tof=x_tof, lengths=lengths, mask=mask,
-                        y=y_a, y_b=y_b, lam=lam, is_mixup=True)
-        elif n == 6:
-            x_imu, x_tof, lengths, mask, y, _ = batch  # 末尾のダミーを無視
-            return dict(x_imu=x_imu, x_tof=x_tof, lengths=lengths, mask=mask,
-                        y=y, y_b=None, lam=None, is_mixup=False)
-        elif n == 5:
-            x_imu, x_tof, lengths, mask, y = batch
-            return dict(x_imu=x_imu, x_tof=x_tof, lengths=lengths, mask=mask,
-                        y=y, y_b=None, lam=None, is_mixup=False)
-        elif n == 4:
-            x_imu, x_tof, lengths, mask = batch
-            return dict(x_imu=x_imu, x_tof=x_tof, lengths=lengths, mask=mask,
-                        y=None, y_b=None, lam=None, is_mixup=False)
+        if n == 5:
+            x_imu, x_tof, y_a, y_b, lam = batch
+            return dict(x_imu=x_imu, x_tof=x_tof, y=y_a, y_b=y_b, lam=lam, is_mixup=True)
+        elif n == 3:
+            x_imu, x_tof, y = batch
+            return dict(x_imu=x_imu, x_tof=x_tof, y=y, y_b=None, lam=None, is_mixup=False)
         else:
             raise RuntimeError(f"Unexpected batch length: {n}")
 
     # ------------------------------------------------------------
     def training_step(self, batch, batch_idx):
-        """
-        期待するバッチ：
-          - mixup_pad_collate_fn(return_soft=False):
-              (x_imu, x_tof, lengths, mask, y_a, y_b, lam)
-          - mixup_pad_collate_fn(return_soft=True) などの soft:
-              (x_imu, x_tof, lengths, mask, y_soft)
-          - 通常:
-              (x_imu, x_tof, lengths, mask, y)
-        """
         b = self._parse_batch(batch)
         bs = b["x_imu"].size(0)
 
         if b["is_mixup"]:
-            logits = self.forward(b["x_imu"], b["x_tof"], b["lengths"], b["mask"])
+            logits = self.forward(b["x_imu"], b["x_tof"])
             loss = self.hparams.cls_loss_weight * (
                 b["lam"] * self._ce(logits, b["y"]) + (1.0 - b["lam"]) * self._ce(logits, b["y_b"])
             )
             preds = logits.argmax(dim=1)
             acc   = b["lam"] * self._acc(preds, b["y"]) + (1.0 - b["lam"]) * self._acc(preds, b["y_b"])
         else:
-            if b["y"] is None:
-                raise RuntimeError("Training step requires labels in the batch.")
-            logits = self.forward(b["x_imu"], b["x_tof"], b["lengths"], b["mask"])
+            logits = self.forward(b["x_imu"], b["x_tof"])
             loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
             preds  = logits.argmax(dim=1)
             acc    = self._acc(preds, b["y"])
 
-        # ログ（学習率も出す）
         log_dict = {"train/loss": loss, "train/acc": acc}
         opt = self.optimizers()
         if opt is not None:
@@ -907,115 +716,112 @@ class litmodel(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         b = self._parse_batch(batch)
         bs = b["x_imu"].size(0)
-        # 検証では mixup を使わず、y を見る（ダミーがあっても無視）
-        if b["y"] is None:
-            raise RuntimeError("Validation step requires labels in the batch.")
-        logits = self.forward(b["x_imu"], b["x_tof"], b["lengths"], b["mask"])
+        logits = self.forward(b["x_imu"], b["x_tof"])
         loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
         preds  = logits.argmax(dim=1)
         acc    = self._acc(preds, b["y"])
+        # Plateau を使うなら monitor: "val/loss" を推奨
         self.log_dict({"val/loss": loss, "val/acc": acc}, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs)
 
     def test_step(self, batch, batch_idx):
         b = self._parse_batch(batch)
         bs = b["x_imu"].size(0)
-        if b["y"] is None:
-            raise RuntimeError("Test step requires labels in the batch.")
-        logits = self.forward(b["x_imu"], b["x_tof"], b["lengths"], b["mask"])
+        logits = self.forward(b["x_imu"], b["x_tof"])
         loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
         self.log_dict({"test/loss": loss}, on_step=False, on_epoch=True, batch_size=bs)
 
-    # ------------------------------------------------------------
-    # Optimizer: AdamW + Warmup(epochs指定) → Cosine（min_lr下限）を step 更新
+    # === 以下、Cosine=AdamW / Plateau=Adam の切替（そのまま） ===
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.lr_init,
-            weight_decay=self.hparams.weight_decay,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
+        sch_cfg  = getattr(self.hparams, "scheduler", None)
+        sch_name = (getattr(sch_cfg, "name", "warmup_cosine") or "warmup_cosine").lower()
 
-        # 総 step 数（optimizer.step の回数）
-        total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
-        if total_steps is None:
-            steps_per_epoch = self.trainer.num_training_batches
-            total_steps = steps_per_epoch * self.trainer.max_epochs
+        decay, no_decay = [], []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 1 or n.endswith(".bias"):
+                no_decay.append(p)
+            else:
+                decay.append(p)
 
-        # ★ warmup を「エポック数」から「ステップ数」へ換算
-        max_epochs    = max(1, int(self.trainer.max_epochs))
-        warmup_epochs = float(self.hparams.warmup_epochs)
-        warmup_steps  = max(1, int(total_steps * (warmup_epochs / max_epochs)))
-        cosine_steps  = max(1, total_steps - warmup_steps)
-        min_lr        = float(self.hparams.min_lr)
+        wd = float(self.hparams.weight_decay)
+        lr = float(self.hparams.lr_init)
 
-        base_lrs = [g["lr"] for g in opt.param_groups]
+        adamw_params = [
+            {"params": decay,    "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        adam_params = [
+            {"params": decay,    "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
 
-        def make_lambda(base_lr: float):
-            # base_lr に対する下限倍率
-            min_factor = 1.0 if min_lr >= base_lr else (min_lr / max(base_lr, 1e-12))
+        if sch_name in ("warmup_cosine", "cosine", "cos"):
+            opt = torch.optim.AdamW(adamw_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
 
-            def lr_lambda(step: int):
-                # ① linear warmup（min_factor→1.0）
-                if step < warmup_steps:
-                    warm = step / float(max(1, warmup_steps))
-                    return min_factor + (1.0 - min_factor) * warm
-                # ② cosine decay（1.0→min_factor）
-                progress = (step - warmup_steps) / float(max(1, cosine_steps))
-                cos_term = 0.5 * (1.0 + math.cos(math.pi * progress))
-                return min_factor + (1.0 - min_factor) * cos_term
+            sched = WarmupCosineScheduler(
+                optimizer=opt,
+                warmup_epochs=self.hparams.warmup_epochs,
+                total_epochs=self.trainer.max_epochs,
+                base_lr=self.hparams.lr_init,
+                final_lr=self.hparams.min_lr,
+            )
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {
+                    "scheduler": sched,
+                    "interval": "epoch",
+                    "frequency": 1,
+                    "name": "warmup_cosine",
+                },
+            }
 
-            return lr_lambda
+        elif sch_name in ("plateau", "reduce_on_plateau", "rop", "reduceplateau"):
+            opt = torch.optim.Adam(adam_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
 
-        sched = torch.optim.lr_scheduler.LambdaLR(
-            opt, lr_lambda=[make_lambda(lr) for lr in base_lrs]
-        )
+            monitor        = getattr(sch_cfg, "monitor", "val/loss")
+            mode           = getattr(sch_cfg, "mode", "min")
+            factor         = float(getattr(sch_cfg, "factor", 0.5))
+            patience       = int(getattr(sch_cfg, "patience", 3))
+            threshold      = float(getattr(sch_cfg, "threshold", 1e-4))
+            threshold_mode = getattr(sch_cfg, "threshold_mode", "rel")
+            cooldown       = int(getattr(sch_cfg, "cooldown", 0))
+            min_lr_sched   = float(getattr(sch_cfg, "min_lr", float(self.hparams.min_lr)))
+            verbose        = bool(getattr(sch_cfg, "verbose", True))
 
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": sched,
-                "interval": "step",   # ← ステップ毎に更新
-                "frequency": 1,
-                "name": "warmup_cosine_minlr",
-            },
-        }
+            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode=mode, factor=factor, patience=patience,
+                threshold=threshold, threshold_mode=threshold_mode,
+                cooldown=cooldown, min_lr=min_lr_sched, eps=1e-8, verbose=verbose
+            )
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {
+                    "scheduler": sched,
+                    "monitor": monitor,
+                    "interval": "epoch",
+                    "frequency": 1,
+                    "reduce_on_plateau": True,
+                    "name": "plateau",
+                },
+            }
 
-# ------------------------------
-# 可変長: IMU + ToF データセット
-# ------------------------------
-class SequenceDatasetVarLenToF(Dataset):
-    def __init__(self, X_imu_list, X_tof_list, y_array, imu_augmenter=None, tof_augmenter=None):
-        """
-        X_imu_list: list[Tensor or ndarray], 各要素 [Ti, C_imu]
-        X_tof_list: list[Tensor or ndarray], 各要素 [Ti, C_tof(=5), H, W]
-        y_array   : np.ndarray[int] or Tensor[int]  （one-hot不要）
-        imu_augmenter: callable(x:[Ti,C_imu])->x
-        tof_augmenter: callable(x:[Ti,5,H,W])->x
-        """
-        assert len(X_imu_list) == len(X_tof_list) == len(y_array)
-        self.X_imu = [torch.as_tensor(x, dtype=torch.float32) for x in X_imu_list]
-        self.X_tof = [torch.as_tensor(x, dtype=torch.float32) for x in X_tof_list]
-        self.y     = torch.as_tensor(y_array, dtype=torch.long)
-        self.aug_imu = imu_augmenter
-        self.aug_tof = tof_augmenter
+        else:
+            raise ValueError(f"Unknown scheduler name: {sch_name}")
 
-        # 長さ整合性チェック（必要ならここで truncate/pad を入れてもよい）
-        for xi, xt in zip(self.X_imu, self.X_tof):
-            if xi.shape[0] != xt.shape[0]:
-                raise ValueError(f"IMU と ToF の時間長が一致していません: {xi.shape[0]} vs {xt.shape[0]}")
 
-    def __len__(self):
-        return len(self.X_imu)
-
-    def __getitem__(self, i):
-        x_imu = self.X_imu[i]
-        x_tof = self.X_tof[i]
-        if self.aug_imu is not None:
-            x_imu = self.aug_imu(x_imu)           # [Ti,C_imu]
-        if self.aug_tof is not None:
-            x_tof = self.aug_tof(x_tof)           # [Ti,5,H,W]
-        return x_imu, x_tof, self.y[i]
+class FixedLenToFDataset(Dataset):
+    def __init__(self, X_imu_list: List[np.ndarray], X_tof_list: List[np.ndarray], y: np.ndarray):
+        self.Xi = X_imu_list
+        self.Xt = X_tof_list
+        self.y  = y
+    def __len__(self): return len(self.y)
+    def __getitem__(self, idx):
+        # テンソル化（float32 / long）
+        xi = torch.from_numpy(self.Xi[idx])            # [L, C_imu]
+        xt = torch.from_numpy(self.Xt[idx])            # [L, Ct, H, W]
+        yy = torch.tensor(self.y[idx], dtype=torch.long)
+        return xi, xt, yy
 
 
 # ------------------------------
@@ -1086,11 +892,9 @@ def collate_pad_tof(batch):
         x_imu_pad[i, :Ti] = xi
         x_tof_pad[i, :Ti] = xt
 
-    mask = torch.arange(L)[None, :].repeat(B, 1) < lengths[:, None]   # [B,L], True=有効
-
     # y は [B] or [B,C] に整形
     ys = torch.stack([torch.as_tensor(y) for y in ys])
-    return x_imu_pad, x_tof_pad, lengths, mask, ys
+    return x_imu_pad, x_tof_pad, ys
 
 
 # ------------------------------
@@ -1101,7 +905,7 @@ def mixup_pad_collate_fn_tof(alpha: float = 0.2):
         return collate_pad_tof
 
     def _collate(batch):
-        x_imu, x_tof, lengths, mask, y = collate_pad_tof(batch)
+        x_imu, x_tof, y = collate_pad_tof(batch)
         B = x_imu.size(0)
         perm = torch.randperm(B)
 
@@ -1111,12 +915,8 @@ def mixup_pad_collate_fn_tof(alpha: float = 0.2):
         x_imu_mix = lam * x_imu + (1.0 - lam) * x_imu[perm]
         x_tof_mix = lam * x_tof + (1.0 - lam) * x_tof[perm]
 
-        # マスクは OR、長さは True の数（※長さに依存する後段は mask を使う前提）
-        mask_mix    = mask | mask[perm]
-        lengths_mix = mask_mix.sum(dim=1)
-
         y_a, y_b = y, y[perm]
-        return x_imu_mix, x_tof_mix, lengths_mix, mask_mix, y_a, y_b, lam
+        return x_imu_mix, x_tof_mix, y_a, y_b, lam
 
     return _collate 
 
@@ -1140,12 +940,42 @@ def _infer_tof_shape(num_tof_cols: int, ct: int = 5, default_hw: Tuple[int,int] 
     assert ct * h * w == num_tof_cols, f"tof_cols({num_tof_cols})が Ct*H*W と一致しません（Ct={ct}, H={h}, W={w}）"
     return (ct, h, w)
 
+
+# ---- pad/truncate（train/val で方針を変える、mask なし）----
+def crop_or_pad_pair_np(xi: np.ndarray, xt: np.ndarray, L: int, mode: str, pad_value: float):
+    T = xi.shape[0]
+    assert xt.shape[0] == T
+    if T >= L:
+        if mode == "random":
+            start = np.random.randint(0, T - L + 1)
+        elif mode == "head":
+            start = 0
+        elif mode == "tail":
+            start = T - L
+        else:  # center
+            start = max((T - L) // 2, 0)
+        return xi[start:start+L], xt[start:start+L]
+    # pad（先頭詰め）
+    C = xi.shape[1]
+    Ct, H, W = xt.shape[1], xt.shape[2], xt.shape[3]
+    out_i = np.full((L, C), pad_value, dtype=xi.dtype)
+    out_t = np.full((L, Ct, H, W), pad_value, dtype=xt.dtype)
+    out_i[:T] = xi
+    out_t[:T] = xt
+    return out_i, out_t
+
 class GestureDataModule(L.LightningDataModule):
     """
-    可変長 IMU + ToF（5×H×W）DataModule
-    - prepare_data: feature_eng → labeling → scaler fit/save → 列保存
-    - setup       : scaler適用 → シーケンス毎に IMU/ToF Tensor化（可変長）→ StratifiedGroupKFold → Dataset
-    - collate     : 可変長 Pad + mask（MixUp対応）
+    IMU + ToF（Ct×H×W）を DataModule 内で固定長に pad/truncate（mask なし）
+      - prepare_data: feature_eng → labeling → scaler fit/save → 列保存
+      - setup       : scaler適用 → シーケンス毎に numpy化 → 固定長化 → Train/Val 分割 → Dataset
+      - DataLoader  : デフォ collate（= stack のみ、mask 返さない）
+    期待する cfg:
+      data.max_seq_len (任意), data.pad_percentile (既定95), data.pad_value, 
+      data.truncate_mode_train ('random'), data.truncate_mode_val ('center'),
+      data.tof_in_channels (既定5), data.tof_hw (任意 [H,W]),
+      data.random_seed, data.raw_dir, data.export_dir, data.n_splits
+      train.batch_size, train.batch_size_val, train.num_workers(任意), train.mixup_alpha(任意)
     """
     def __init__(self, cfg, fold_idx: int):
         super().__init__()
@@ -1154,13 +984,28 @@ class GestureDataModule(L.LightningDataModule):
         self.n_splits = cfg.data.n_splits
 
         self.raw_dir = Path(cfg.data.raw_dir)
-        self.export_dir = HydraConfig.get().runtime.output_dir / pathlib.Path(cfg.data.export_dir)
+        self.export_dir = HydraConfig.get().runtime.output_dir / Path(cfg.data.export_dir)
 
         self.batch = cfg.train.batch_size
         self.batch_val = cfg.train.batch_size_val
-        self.mixup_a = cfg.train.mixup_alpha
+        self.num_workers = int(getattr(cfg.train, "num_workers", 4))
+        self.mixup_a = getattr(cfg.train, "mixup_alpha", 0.0)  # ここでは未使用（maskなしで固定長のため）
 
-    # --------------------------
+        # 固定長 & トリミング方針
+        self.max_seq_len: Optional[int] = self.cfg.data.max_seq_len
+        self.pad_percentile: int = int(getattr(self.cfg.data, "pad_percentile", 95))
+        self.pad_value: float = float(getattr(self.cfg.data, "pad_value", 0.0))
+        self.truncate_mode_train: str = getattr(self.cfg.data, "truncate_mode_train", "random")  # random/head/tail/center
+        self.truncate_mode_val:   str = getattr(self.cfg.data, "truncate_mode_val",   "center")
+
+        # 後で埋める
+        self.num_classes: int = 0
+        self.feat_cols: List[str] = []
+        self.imu_cols:  List[str] = []
+        self.tof_cols:  List[str] = []
+        self.tof_shape: Tuple[int,int,int] = (5, 8, 8)  # (Ct,H,W)
+        self.class_weight: torch.Tensor | None = None
+
     def prepare_data(self):
         df = pd.read_csv(self.raw_dir / "train.csv")
         df = feature_eng(df)
@@ -1186,100 +1031,115 @@ class GestureDataModule(L.LightningDataModule):
         self.num_classes = len(classes)
 
         # 列とスケーラ
-        feat_cols = np.load(self.export_dir / "feature_cols.npy", allow_pickle=True).tolist()
-        imu_cols  = np.load(self.export_dir / "imu_cols.npy",    allow_pickle=True).tolist()
-        tof_cols  = np.load(self.export_dir / "tof_cols.npy",    allow_pickle=True).tolist()
+        self.feat_cols = np.load(self.export_dir / "feature_cols.npy", allow_pickle=True).tolist()
+        self.imu_cols  = np.load(self.export_dir / "imu_cols.npy",    allow_pickle=True).tolist()
+        self.tof_cols  = np.load(self.export_dir / "tof_cols.npy",    allow_pickle=True).tolist()
         scaler: StandardScaler = joblib.load(self.export_dir / "scaler.pkl")
+
+        self.imu_ch = len(self.imu_cols)
 
         # ToF 形状
         ct = int(getattr(self.cfg.data, "tof_in_channels", 5))
         if getattr(self.cfg.data, "tof_hw", None) is not None:
             h, w = tuple(self.cfg.data.tof_hw)
-            tof_shape = (ct, h, w)
-            assert ct * h * w == len(tof_cols), "tof_hw と tof_cols 数が一致しません"
+            assert ct * h * w == len(self.tof_cols), "tof_hw と tof_cols 数が一致しません"
+            self.tof_shape = (ct, h, w)
         else:
-            tof_shape = _infer_tof_shape(len(tof_cols), ct=ct, default_hw=(8, 8))
+            self.tof_shape = _infer_tof_shape(len(self.tof_cols), ct=ct, default_hw=(8, 8))
 
         # スケール適用
-        df_feat = df[feat_cols].ffill().bfill().fillna(0)
-        df[feat_cols] = scaler.transform(df_feat.values)
+        df_feat = df[self.feat_cols].ffill().bfill().fillna(0)
+        df[self.feat_cols] = scaler.transform(df_feat.values)
 
-        # ---- 可変長テンソルを構成 ----
-        X_imu_list: List[torch.Tensor] = []
-        X_tof_list: List[torch.Tensor] = []
+        # ---- シーケンス毎に numpy へ ----
+        X_imu_list: List[np.ndarray] = []
+        X_tof_list: List[np.ndarray] = []
         y_list: List[int] = []
         subjects: List[str] = []
 
         subj_col = "subject" if "subject" in df.columns else None
+        imu_idx = [self.feat_cols.index(c) for c in self.imu_cols]
+        tof_idx = [self.feat_cols.index(c) for c in self.tof_cols]
+        Ct, H, W = self.tof_shape
 
-        for _, seq in df.groupby("sequence_id"):
-            x_imu, x_tof = preprocess_sequence_tof(
-                df_seq=seq,
-                feature_cols=feat_cols,
-                imu_cols=imu_cols,
-                tof_cols=tof_cols,
-                scaler=scaler,
-                tof_shape=tof_shape,
-            )
-            X_imu_list.append(x_imu)  # [Ti,C_imu]
-            X_tof_list.append(x_tof)  # [Ti,Ct,H,W]
+        lengths: List[int] = []
+        for sid, seq in df.groupby("sequence_id"):
+            arr = seq[self.feat_cols].to_numpy(dtype=np.float32, copy=False)  # [T, F]
+            T = arr.shape[0]
+            lengths.append(T)
+
+            imu = arr[:, imu_idx]                                 # [T, C_imu]
+            tof_flat = arr[:, tof_idx]                             # [T, Ct*H*W]
+            tof = tof_flat.reshape(T, Ct, H, W)                    # [T, Ct, H, W]
+
+            X_imu_list.append(imu)
+            X_tof_list.append(tof)
             y_list.append(int(seq["gesture_int"].iloc[0]))
-            subjects.append(seq[subj_col].iloc[0] if subj_col else int(seq["sequence_id"].iloc[0]))
+            subjects.append(seq[subj_col].iloc[0] if subj_col else int(sid))
 
-        y_int = np.array(y_list, dtype=np.int64)
+        y_int = np.asarray(y_list, dtype=np.int64)
 
-        # ---- StratifiedGroupKFold ----
-        skf = StratifiedKFold(
-            n_splits=self.n_splits,
-            shuffle=True,
-            random_state=self.cfg.data.random_seed
-        )
-        groups = np.array(subjects)
-        tr_idx, val_idx = list(skf.split(np.arange(len(X_imu_list)), y_int))[self.fold_idx]
+        # ---- 固定長 L を決める ----
+        if self.max_seq_len is not None and int(self.max_seq_len) > 0:
+            L = int(self.max_seq_len)
+        else:
+            L = int(np.percentile(lengths, self.pad_percentile))
+        self.max_seq_len = L
+        np.save(self.export_dir / "sequence_maxlen.npy", L)
+        np.save(self.export_dir / "tof_shape.npy", np.array(self.tof_shape))
 
-        # ---- Dataset ----
-        X_imu_tr = [X_imu_list[i] for i in tr_idx]
-        X_tof_tr = [X_tof_list[i] for i in tr_idx]
-        y_tr     = y_int[tr_idx]
+        # ---- split（subject があれば StratifiedGroupKFold）----
+        idx_all = np.arange(len(X_imu_list))
 
-        X_imu_va = [X_imu_list[i] for i in val_idx]
-        X_tof_va = [X_tof_list[i] for i in val_idx]
-        y_va     = y_int[val_idx]
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
+                                random_state=self.cfg.data.random_seed)
+        tr_idx, val_idx = list(skf.split(idx_all, y_int))[self.fold_idx]
 
-        self._train_ds = SequenceDatasetVarLenToF(X_imu_tr, X_tof_tr, y_tr, imu_augmenter=None, tof_augmenter=None)
-        self._val_ds   = SequenceDatasetVarLenToF(X_imu_va, X_tof_va, y_va, imu_augmenter=None, tof_augmenter=None)
+        Xtr_imu, Xtr_tof, ytr = [], [], []
+        for i in tr_idx:
+            xi, xt = crop_or_pad_pair_np(X_imu_list[i], X_tof_list[i], L, self.truncate_mode_train, self.pad_value)
+            Xtr_imu.append(xi)
+            Xtr_tof.append(xt)
+            ytr.append(y_int[i])
+
+        Xva_imu, Xva_tof, yva = [], [], []
+        for i in val_idx:
+            xi, xt = crop_or_pad_pair_np(X_imu_list[i], X_tof_list[i], L, self.truncate_mode_val, self.pad_value)
+            Xva_imu.append(xi)
+            Xva_tof.append(xt)
+            yva.append(y_int[i])
+
+        ytr = np.asarray(ytr, dtype=np.int64)
+        yva = np.asarray(yva, dtype=np.int64)
+
+        self._train_ds = FixedLenToFDataset(Xtr_imu, Xtr_tof, ytr)
+        self._val_ds   = FixedLenToFDataset(Xva_imu, Xva_tof, yva)
 
         # ---- class_weight & steps/epoch ----
         self.class_weight = torch.tensor(
-            compute_class_weight(class_weight="balanced", classes=np.arange(self.num_classes), y=y_tr),
+            compute_class_weight(class_weight="balanced", classes=np.arange(self.num_classes), y=ytr),
             dtype=torch.float32
         )
         self.steps_per_epoch = math.ceil(len(tr_idx) / self.batch)
 
-        # 便利に保存
-        np.save(self.export_dir / "tof_shape.npy", np.array(tof_shape))
-
     # --------------------------
     def train_dataloader(self):
-        if self.mixup_a and self.mixup_a > 0:
-            collate_fn = mixup_pad_collate_fn_tof(self.mixup_a)
-        else:
-            collate_fn = collate_pad_tof
         return DataLoader(
             self._train_ds,
-            batch_size=self.batch, shuffle=True, drop_last=True,
-            num_workers=4,
+            batch_size=self.batch,
+            shuffle=True,
+            drop_last=True,
+            num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_fn,
+            persistent_workers=(self.num_workers > 0),
         )
 
     def val_dataloader(self):
         return DataLoader(
             self._val_ds,
-            batch_size=self.batch_val, shuffle=False,
-            num_workers=4,
+            batch_size=self.batch_val,
+            shuffle=False,
+            num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=collate_pad_tof,
+            persistent_workers=(self.num_workers > 0),
         )

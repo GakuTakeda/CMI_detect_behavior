@@ -3,34 +3,51 @@ data:
   raw_dir: ../data
   export_dir: output
   random_seed: 42
+  max_seq_len: null
+  pad_percentile: 95
+  pad_value: 0.0
+  truncate_mode_train: tail  # random/head/tail/center
+  truncate_mode_val: tail     # random/head/tail/center
 
 train:
   batch_size: 128
   batch_size_val: 128
   mixup_alpha: 0.2
-  lr_init: 1e-4
-  min_lr: 1e-6
+  lr_init: 5e-4
+  min_lr: 1e-5
   weight_decay: 3e-3
-  epochs: 150
+  epochs: 100
   warmup_epochs: 30
   device: cuda
   patience: 40
+  scheduler:
+    # name: warmup_cosine    # ← これなら AdamW + WarmupCosine
+    name: plateau            # ← これなら Adam + ReduceLROnPlateau
+    monitor: val_macro_f1    # Loss なら "val_loss"
+    mode: max                # Loss の時は "min"
+    factor: 0.5
+    patience: 3
+    threshold: 0.0005
+    threshold_mode: rel
+    cooldown: 0
+    min_lr: 1e-6
+    verbose: true
 
-imu_dim: None
-num_classes: None
+imu_dim: null         # ← 実行時にセット（例: 9）
+num_classes: null     # ← 実行時にセット（例: 23）
 
-tof: #ここはあまり変えないほうがいいと思う
+tof:
   in_channels: 5
   out_dim: 32
 
 cnn:
   multiscale:
-    kernel_sizes: [3,5,7]
+    kernel_sizes: [3, 5, 7]
     out_per_kernel: 12
   residual:
     out_channels: 48
     num_blocks: 2
-  share_branch: false
+  share_branch: false   # true で全IMU軸のCNNを重み共有
 
 rnn:
   hidden_size: 128
@@ -41,6 +58,7 @@ rnn:
 meta:
   proj_dim: 64
   dropout: 0.2
+  stats_per_channel: 5   
 
 noise_std: 0.09
 
