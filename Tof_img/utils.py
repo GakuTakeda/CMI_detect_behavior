@@ -35,6 +35,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import json
 
 class calc_f1:
     def __init__(self):
@@ -644,6 +645,7 @@ class litmodel(L.LightningModule):
             self.class_weight = None
 
         self.mse = nn.MSELoss()
+        self.cfg = cfg
 
     # ------------------------------------------------------------
     def forward(self, x_imu: torch.Tensor, x_tof: torch.Tensor) -> torch.Tensor:
@@ -651,14 +653,17 @@ class litmodel(L.LightningModule):
         return self.model(x_imu, x_tof)  # -> logits
 
     # ---- CE（hard/soft両対応） ----
-    def _ce(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _ce(self, logits: torch.Tensor, target: torch.Tensor, use_weight: bool = True) -> torch.Tensor:
         # soft-label
         if target.ndim == 2 and target.dtype != torch.long:
             logp = F.log_softmax(logits, dim=1)
             return -(target * logp).sum(dim=1).mean()
         # hard-label
         hard = target if target.ndim == 1 else target.argmax(dim=1)
-        ce = nn.CrossEntropyLoss(weight=self.class_weight)
+        if use_weight and self.class_weight is not None:
+            ce = nn.CrossEntropyLoss(weight=self.class_weight)
+        else:
+            ce = nn.CrossEntropyLoss()
         return ce(logits, hard)
 
     # ---- accuracy ----
@@ -727,13 +732,12 @@ class litmodel(L.LightningModule):
         b = self._parse_batch(batch)
         bs = b["x_imu"].size(0)
         logits = self.forward(b["x_imu"], b["x_tof"])
-        loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
+        loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"], use_weight=False)
         self.log_dict({"test/loss": loss}, on_step=False, on_epoch=True, batch_size=bs)
 
     # === 以下、Cosine=AdamW / Plateau=Adam の切替（そのまま） ===
     def configure_optimizers(self):
         sch_cfg  = getattr(self.hparams, "scheduler", None)
-        sch_name = (getattr(sch_cfg, "name", "warmup_cosine") or "warmup_cosine").lower()
 
         decay, no_decay = [], []
         for n, p in self.named_parameters():
@@ -756,7 +760,7 @@ class litmodel(L.LightningModule):
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
-        if sch_name in ("warmup_cosine", "cosine", "cos"):
+        if self.cfg.scheduler.name in ("warmup_cosine", "cosine", "cos"):
             opt = torch.optim.AdamW(adamw_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
 
             sched = WarmupCosineScheduler(
@@ -776,29 +780,19 @@ class litmodel(L.LightningModule):
                 },
             }
 
-        elif sch_name in ("plateau", "reduce_on_plateau", "rop", "reduceplateau"):
+        elif self.cfg.scheduler.name in ("plateau", "reduce_on_plateau", "rop", "reduceplateau"):
             opt = torch.optim.Adam(adam_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
 
-            monitor        = getattr(sch_cfg, "monitor", "val/loss")
-            mode           = getattr(sch_cfg, "mode", "min")
-            factor         = float(getattr(sch_cfg, "factor", 0.5))
-            patience       = int(getattr(sch_cfg, "patience", 3))
-            threshold      = float(getattr(sch_cfg, "threshold", 1e-4))
-            threshold_mode = getattr(sch_cfg, "threshold_mode", "rel")
-            cooldown       = int(getattr(sch_cfg, "cooldown", 0))
-            min_lr_sched   = float(getattr(sch_cfg, "min_lr", float(self.hparams.min_lr)))
-            verbose        = bool(getattr(sch_cfg, "verbose", True))
-
             sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, mode=mode, factor=factor, patience=patience,
-                threshold=threshold, threshold_mode=threshold_mode,
-                cooldown=cooldown, min_lr=min_lr_sched, eps=1e-8, verbose=verbose
+                opt, mode=self.cfg.scheduler.mode, factor=self.cfg.scheduler.factor, patience=self.cfg.scheduler.patience,
+                threshold=self.cfg.scheduler.threshold, threshold_mode=self.cfg.scheduler.threshold_mode,
+                cooldown=self.cfg.scheduler.cooldown, min_lr=self.cfg.scheduler.min_lr_sched, eps=1e-8, verbose=self.cfg.scheduler.verbose
             )
             return {
                 "optimizer": opt,
                 "lr_scheduler": {
                     "scheduler": sched,
-                    "monitor": monitor,
+                    "monitor": self.cfg.scheduler.monitor,
                     "interval": "epoch",
                     "frequency": 1,
                     "reduce_on_plateau": True,
@@ -807,7 +801,7 @@ class litmodel(L.LightningModule):
             }
 
         else:
-            raise ValueError(f"Unknown scheduler name: {sch_name}")
+            raise ValueError(f"Unknown scheduler name: {self.cfg.scheduler.name}")
 
 
 
@@ -1149,18 +1143,6 @@ def crop_or_pad_pair_np(xi: np.ndarray, xt: np.ndarray, L: int, mode: str, pad_v
     return out_i, out_t
 
 class GestureDataModule(L.LightningDataModule):
-    """
-    IMU + ToF（Ct×H×W）を DataModule 内で固定長に pad/truncate（mask なし）
-      - prepare_data: feature_eng → labeling → scaler fit/save → 列保存
-      - setup       : scaler適用 → シーケンス毎に numpy化 → 固定長化 → Train/Val 分割 → Dataset
-      - DataLoader  : デフォ collate（= stack のみ、mask 返さない）
-    期待する cfg:
-      data.max_seq_len (任意), data.pad_percentile (既定95), data.pad_value, 
-      data.truncate_mode_train ('random'), data.truncate_mode_val ('center'),
-      data.tof_in_channels (既定5), data.tof_hw (任意 [H,W]),
-      data.random_seed, data.raw_dir, data.export_dir, data.n_splits
-      train.batch_size, train.batch_size_val, train.num_workers(任意), train.mixup_alpha(任意)
-    """
     def __init__(self, cfg, fold_idx: int):
         super().__init__()
         self.cfg = cfg
@@ -1231,6 +1213,24 @@ class GestureDataModule(L.LightningDataModule):
         else:
             self.tof_shape = _infer_tof_shape(len(self.tof_cols), ct=ct, default_hw=(8, 8))
 
+        if self.cfg.data.tof_null_thresh is not None:
+            drop_info = []
+            bad_ids = []
+            for sid, seq in df.groupby("sequence_id"):
+                tof_np = seq[self.tof_cols].to_numpy(dtype=np.float32, copy=False)
+                total = int(tof_np.size)
+                nulls = int(np.count_nonzero(tof_np == -1))
+                frac = (nulls / total) if total > 0 else 1.0
+                if frac >= self.tof_null_thresh:
+                    bad_ids.append(sid)
+                    drop_info.append((sid, nulls, total, frac))
+            if bad_ids:
+                # 除外 & ログ保存
+                df = df[~df["sequence_id"].isin(bad_ids)].copy()
+                pd.DataFrame(drop_info, columns=["sequence_id", "n_null", "n_total", "null_frac"])\
+                  .to_csv(self.export_dir / "dropped_sequences_tof_null.csv", index=False)
+                print(f"[DataModule] Dropped {len(bad_ids)} sequences by ToF null ratio >= {self.tof_null_thresh}")
+
         # スケール適用
         df_feat = df[self.feat_cols].ffill().bfill().fillna(0)
         df[self.feat_cols] = scaler.transform(df_feat.values)
@@ -1240,6 +1240,7 @@ class GestureDataModule(L.LightningDataModule):
         X_tof_list: List[np.ndarray] = []
         y_list: List[int] = []
         subjects: List[str] = []
+        seq_ids: List[str] = []
 
         subj_col = "subject" if "subject" in df.columns else None
         imu_idx = [self.feat_cols.index(c) for c in self.imu_cols]
@@ -1260,6 +1261,7 @@ class GestureDataModule(L.LightningDataModule):
             X_tof_list.append(tof)
             y_list.append(int(seq["gesture_int"].iloc[0]))
             subjects.append(seq[subj_col].iloc[0] if subj_col else int(sid))
+            seq_ids.append(sid)
 
         y_int = np.asarray(y_list, dtype=np.int64)
 
@@ -1275,9 +1277,28 @@ class GestureDataModule(L.LightningDataModule):
         # ---- split（subject があれば StratifiedGroupKFold）----
         idx_all = np.arange(len(X_imu_list))
 
-        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
+        sgkf = StratifiedGroupKFold(n_splits=self.n_splits, shuffle=True,
                                 random_state=self.cfg.data.random_seed)
-        tr_idx, val_idx = list(skf.split(idx_all, y_int))[self.fold_idx]
+        tr_idx, val_idx = list(sgkf.split(idx_all, y_int, subjects))[self.fold_idx]
+        classes_arr = np.array(classes).tolist()
+
+        def pack(indices):
+            return {
+                str(seq_ids[i]): {
+                    "subject": subjects[i],
+                    "gesture": classes_arr[int(y_int[i])]
+                } for i in indices
+            }
+
+        split_map = {
+            "fold": int(self.fold_idx),
+            "train": pack(tr_idx),
+            "val":   pack(val_idx),
+        }
+
+        # JSON
+        with open(self.export_dir / f"seq_split_fold{self.fold_idx}.json", "w", encoding="utf-8") as f:
+            json.dump(split_map, f, ensure_ascii=False, indent=2)
 
         Xtr_imu, Xtr_tof, ytr = [], [], []
         for i in tr_idx:

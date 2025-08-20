@@ -6,10 +6,10 @@ data:
   max_seq_len: null
   pad_percentile: 95
   pad_value: 0.0
-  truncate_mode_train: center  # random/head/tail/center
-  truncate_mode_val: center     # random/head/tail/center
+  truncate_mode_train: tail  # random/head/tail/center
+  truncate_mode_val: tail     # random/head/tail/center
   tof_in_channels: 5
-  tof_null_thresh: 300
+  tof_null_thresh: 250
 
 train:
   batch_size: 128
@@ -26,7 +26,7 @@ train:
   scheduler:
     # name: warmup_cosine    # ← これなら AdamW + WarmupCosine
     name: plateau            # ← これなら Adam + ReduceLROnPlateau
-    monitor: val_macro_f1    # Loss なら "val_loss"
+    monitor: val_acc    # Loss なら "val_loss"
     mode: max                # Loss の時は "min"
     factor: 0.5
     patience: 3
@@ -70,7 +70,7 @@ head:
   dropout: 0.5
 
 aug:
-  no_aug: false
+  no_aug: true
 
   # 時間方向
   p_time_shift: 0.7
