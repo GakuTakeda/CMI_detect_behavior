@@ -6,13 +6,15 @@ data:
   max_seq_len: null
   pad_percentile: 95
   pad_value: 0.0
-  truncate_mode_train: tail  # random/head/tail/center
-  truncate_mode_val: tail     # random/head/tail/center
+  truncate_mode_train: center  # random/head/tail/center
+  truncate_mode_val: center     # random/head/tail/center
+  tof_in_channels: 5
+  tof_null_thresh: 300
 
 train:
   batch_size: 128
   batch_size_val: 128
-  mixup_alpha: 0.2
+  mixup_alpha: 0.0
   lr_init: 5e-4
   min_lr: 1e-5
   weight_decay: 3e-3
@@ -20,6 +22,7 @@ train:
   warmup_epochs: 30
   device: cuda
   patience: 40
+  num_workers: 4
   scheduler:
     # name: warmup_cosine    # ← これなら AdamW + WarmupCosine
     name: plateau            # ← これなら Adam + ReduceLROnPlateau
@@ -65,3 +68,39 @@ noise_std: 0.09
 head:
   hidden: 512
   dropout: 0.5
+
+aug:
+  no_aug: false
+
+  # 時間方向
+  p_time_shift: 0.7
+  max_shift_ratio: 0.1
+  p_time_warp: 0.5
+  warp_min: 0.9
+  warp_max: 1.1
+  p_block_dropout: 0.5
+  n_blocks: [1, 2]
+  block_len: [2, 5]
+
+  # IMU系
+  p_imu_jitter: 0.9
+  imu_sigma: 0.03
+  p_imu_scale: 0.5
+  imu_scale_sigma: 0.03
+  p_imu_drift: 0.5
+  drift_std: 0.003
+  drift_clip: 0.25
+  p_imu_small_rot: 0.0   # 使うなら 0.2 など
+  rot_deg: 5.0
+
+  # ToF系
+  p_tof_ch_drop: 0.2
+  p_tof_erasing: 0.3
+  erase_hw: [[2, 4], [2, 4]]   # [[eh_min, eh_max], [ew_min, ew_max]]
+  n_erase: [1, 2]
+  p_tof_shift: 0.3
+  p_tof_gain_noise: 0.7
+  tof_gain: [0.95, 1.05]
+  tof_sigma: 0.01
+
+  pad_value: 0.0

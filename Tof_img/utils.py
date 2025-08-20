@@ -810,6 +810,7 @@ class litmodel(L.LightningModule):
             raise ValueError(f"Unknown scheduler name: {sch_name}")
 
 
+
 class FixedLenToFDataset(Dataset):
     def __init__(self, X_imu_list: List[np.ndarray], X_tof_list: List[np.ndarray], y: np.ndarray):
         self.Xi = X_imu_list
@@ -822,44 +823,230 @@ class FixedLenToFDataset(Dataset):
         xt = torch.from_numpy(self.Xt[idx])            # [L, Ct, H, W]
         yy = torch.tensor(self.y[idx], dtype=torch.long)
         return xi, xt, yy
+    
+def _randu(a=0.0, b=1.0): return np.random.uniform(a, b)
+def _randn(s=1.0): return np.random.randn() * s
 
-
-# ------------------------------
-# 前処理: 1シーケンス → (IMU, ToF) テンソル
-# ------------------------------
-def preprocess_sequence_tof(
-    df_seq: pd.DataFrame,
-    feature_cols: list[str],
-    imu_cols: list[str],
-    tof_cols: list[str],
-    scaler: StandardScaler,
-    tof_shape: tuple[int,int,int] = (5, 8, 8),
-) -> tuple[torch.Tensor, torch.Tensor]:
+class AugmentIMUToF:
     """
-    - 欠損を ffill/bfill → 0
-    - StandardScaler.transform
-    - IMU と ToF を分離し torch.Tensor へ
-    戻り:
-      x_imu: [T, C_imu]
-      x_tof: [T, 5, H, W]
+    入出力:
+      imu: [L, C_imu]  (float32)
+      tof: [L, Ct, H, W] (float32)
+    返り値も同形状（maskなし・固定長のまま）
     """
-    mat = (
-        df_seq[feature_cols]
-        .ffill().bfill().fillna(0)
-        .values
-    )
-    mat = scaler.transform(mat).astype("float32")
+    def __init__(self,
+        p_time_shift=0.7, max_shift_ratio=0.1,
+        p_time_warp=0.5,  warp_min=0.9, warp_max=1.1,
+        p_block_dropout=0.5, n_blocks=(1,3), block_len=(2,6),
 
-    feat_idx = {c: i for i, c in enumerate(feature_cols)}
-    imu_idx  = [feat_idx[c] for c in imu_cols]
-    tof_idx  = [feat_idx[c] for c in tof_cols]
+        p_imu_jitter=0.9, imu_sigma=0.03,
+        p_imu_scale=0.5,  imu_scale_sigma=0.03,
+        p_imu_drift=0.5,  drift_std=0.003, drift_clip=0.3,
+        p_imu_small_rot=0.0, rot_deg=5.0,  # 必要なら有効化
 
-    x_imu = torch.from_numpy(mat[:, imu_idx])  # [T, C_imu]
+        p_tof_ch_drop=0.2,
+        p_tof_erasing=0.3, erase_hw=( (2,4), (2,4) ), n_erase=(1,2),
+        p_tof_shift=0.3,
+        p_tof_gain_noise=0.7, tof_gain=(0.95,1.05), tof_sigma=0.01,
+        pad_value=0.0,
+    ):
+        self.p_time_shift = p_time_shift
+        self.max_shift_ratio = max_shift_ratio
+        self.p_time_warp = p_time_warp
+        self.warp_min, self.warp_max = warp_min, warp_max
+        self.p_block_dropout = p_block_dropout
+        self.n_blocks, self.block_len = n_blocks, block_len
 
-    T = mat.shape[0]
-    Ct, H, W = tof_shape
-    x_tof = torch.from_numpy(mat[:, tof_idx]).view(T, Ct, H, W)  # [T, 5, H, W]
-    return x_imu, x_tof
+        self.p_imu_jitter = p_imu_jitter
+        self.imu_sigma = imu_sigma
+        self.p_imu_scale = p_imu_scale
+        self.imu_scale_sigma = imu_scale_sigma
+        self.p_imu_drift = p_imu_drift
+        self.drift_std = drift_std
+        self.drift_clip = drift_clip
+        self.p_imu_small_rot = p_imu_small_rot
+        self.rot_deg = rot_deg
+
+        self.p_tof_ch_drop = p_tof_ch_drop
+        self.p_tof_erasing = p_tof_erasing
+        self.erase_hw = erase_hw
+        self.n_erase = n_erase
+        self.p_tof_shift = p_tof_shift
+        self.p_tof_gain_noise = p_tof_gain_noise
+        self.tof_gain = tof_gain
+        self.tof_sigma = tof_sigma
+
+        self.pad_value = pad_value
+
+    # ---------- time ops ----------
+    def _time_shift(self, x, shift):
+        L = x.shape[0]
+        if shift == 0: return x
+        out = np.full_like(x, self.pad_value)
+        if shift > 0:
+            out[shift:] = x[:L-shift]
+        else:
+            out[:L+shift] = x[-shift:]
+        return out
+
+    def _time_warp(self, x: np.ndarray, scale: float) -> np.ndarray:
+        """
+        x.ndim == 2: [L, C]
+        x.ndim == 4: [L, Ct, H, W]
+        時間長 L を scale 倍に伸縮→元の L に戻す（値は線形補間）
+        """
+        L = x.shape[0]
+        Lp = max(2, int(round(L * scale)))
+
+        if x.ndim == 2:  # [L, C]
+            t = torch.from_numpy(x.astype(np.float32))         # [L, C]
+            t = t.transpose(0, 1).unsqueeze(0)                 # [1, C, L]
+            y = F.interpolate(t, size=Lp, mode="linear", align_corners=False)
+            y = F.interpolate(y, size=L,  mode="linear", align_corners=False)
+            y = y.squeeze(0).transpose(0, 1).contiguous().numpy()  # [L, C]
+            return y
+
+        if x.ndim == 4:  # [L, Ct, H, W]
+            L, Ct, H, W = x.shape
+            xf = x.reshape(L, Ct * H * W)                      # [L, Cflat]
+            t  = torch.from_numpy(xf.astype(np.float32)).transpose(0, 1).unsqueeze(0)  # [1, Cflat, L]
+            y  = F.interpolate(t, size=Lp, mode="linear", align_corners=False)
+            y  = F.interpolate(y, size=L,  mode="linear", align_corners=False)
+            y  = y.squeeze(0).transpose(0, 1).contiguous().numpy().reshape(L, Ct, H, W)
+            return y
+
+        # 想定外の次元はそのまま返す
+        return x
+
+    def _block_dropout(self, x):
+        L = x.shape[0]
+        nb = np.random.randint(self.n_blocks[0], self.n_blocks[1]+1)
+        for _ in range(nb):
+            bl = np.random.randint(self.block_len[0], self.block_len[1]+1)
+            s = np.random.randint(0, max(1, L - bl + 1))
+            x[s:s+bl] = self.pad_value
+        return x
+
+    # ---------- imu ops ----------
+    def _imu_jitter(self, imu):        # add noise
+        return imu + np.random.randn(*imu.shape).astype(np.float32) * self.imu_sigma
+
+    def _imu_scale(self, imu):         # per-channel scale
+        scale = (1.0 + np.random.randn(imu.shape[1]).astype(np.float32) * self.imu_scale_sigma)
+        return imu * scale[None, :]
+
+    def _imu_drift(self, imu):
+        L, C = imu.shape
+        drift = np.cumsum(np.random.randn(L, C).astype(np.float32) * self.drift_std, axis=0)
+        np.clip(drift, -self.drift_clip, self.drift_clip, out=drift)
+        return imu + drift
+
+    def _imu_small_rot(self, imu):
+        # acc_x,y,z と gyro_x,y,z が連続3軸で並んでいる前提なら、各3軸塊に回転を適用
+        th = np.deg2rad(self.rot_deg) * np.random.uniform(-1,1)
+        # 単純なZ軸近傍回転（必要に応じて拡張）
+        Rz = np.array([[ np.cos(th), -np.sin(th), 0],
+                       [ np.sin(th),  np.cos(th), 0],
+                       [ 0,           0,          1]], dtype=np.float32)
+        def rot3(block):
+            return (block @ Rz.T).astype(np.float32)
+        imu_out = imu.copy()
+        # 例: 先頭3列=acc, 次の3列=gyro などに合わせて編集
+        if imu.shape[1] >= 3:
+            imu_out[:, :3] = rot3(imu[:, :3])
+        if imu.shape[1] >= 6:
+            imu_out[:, 3:6] = rot3(imu[:, 3:6])
+        return imu_out
+
+    # ---------- tof ops ----------
+    def _tof_channel_dropout(self, tof):
+        Ct = tof.shape[1]
+        ch = np.random.randint(0, Ct)
+        tof[:, ch] = 0.0
+        return tof
+
+    def _tof_erasing(self, tof):
+        L, Ct, H, W = tof.shape
+        n = np.random.randint(self.n_erase[0], self.n_erase[1]+1)
+        for _ in range(n):
+            eh = np.random.randint(self.erase_hw[0][0], self.erase_hw[0][1]+1)
+            ew = np.random.randint(self.erase_hw[1][0], self.erase_hw[1][1]+1)
+            t  = np.random.randint(0, L)
+            y0 = np.random.randint(0, max(1, H - eh + 1))
+            x0 = np.random.randint(0, max(1, W - ew + 1))
+            tof[t, :, y0:y0+eh, x0:x0+ew] = 0.0
+        return tof
+
+    def _tof_shift(self, tof):
+        dy = np.random.choice([-1, 0, 1])
+        dx = np.random.choice([-1, 0, 1])
+        if dy == 0 and dx == 0: return tof
+        out = np.full_like(tof, self.pad_value)
+        if dy >= 0:
+            ys = slice(dy, None)
+            yd = slice(0, tof.shape[2]-dy)
+        else:
+            ys = slice(0, dy)
+            yd = slice(-dy, None)
+        if dx >= 0:
+            xs = slice(dx, None)
+            xd = slice(0, tof.shape[3]-dx)
+        else:
+            xs = slice(0, dx)
+            xd = slice(-dx, None)
+        out[:, :, yd, xd] = tof[:, :, ys, xs]
+        return out
+
+    def _tof_gain_noise(self, tof):
+        gain = _randu(*self.tof_gain)
+        noise = np.random.randn(*tof.shape).astype(np.float32) * self.tof_sigma
+        return tof * gain + noise
+
+    # ---------- main ----------
+    def __call__(self, imu: np.ndarray, tof: np.ndarray):
+        L = imu.shape[0]
+        # 時間系
+        if np.random.rand() < self.p_time_shift:
+            shift = int(np.round(_randu(-self.max_shift_ratio, self.max_shift_ratio) * L))
+            imu = self._time_shift(imu, shift)
+            tof = self._time_shift(tof, shift)
+        if np.random.rand() < self.p_time_warp:
+            s = _randu(self.warp_min, self.warp_max)
+            imu = self._time_warp(imu, s)
+            tof = self._time_warp(tof, s)
+        if np.random.rand() < self.p_block_dropout:
+            imu = self._block_dropout(imu)
+            tof = self._block_dropout(tof)
+
+        # IMU
+        if np.random.rand() < self.p_imu_jitter: imu = self._imu_jitter(imu)
+        if np.random.rand() < self.p_imu_scale:  imu = self._imu_scale(imu)
+        if np.random.rand() < self.p_imu_drift:  imu = self._imu_drift(imu)
+        if self.p_imu_small_rot > 0 and np.random.rand() < self.p_imu_small_rot:
+            imu = self._imu_small_rot(imu)
+
+        # ToF
+        if np.random.rand() < self.p_tof_ch_drop:  tof = self._tof_channel_dropout(tof)
+        if np.random.rand() < self.p_tof_erasing:  tof = self._tof_erasing(tof)
+        if np.random.rand() < self.p_tof_shift:    tof = self._tof_shift(tof)
+        if np.random.rand() < self.p_tof_gain_noise: tof = self._tof_gain_noise(tof)
+
+        return imu.astype(np.float32), tof.astype(np.float32)
+
+
+# 学習用 Dataset を差し替え
+class FixedLenToFDatasetAug(FixedLenToFDataset):
+    def __init__(self, X_imu_list, X_tof_list, y, augmenter: AugmentIMUToF):
+        super().__init__(X_imu_list, X_tof_list, y)
+        self.aug = augmenter
+    def __getitem__(self, idx):
+        imu = self.Xi[idx].copy()
+        tof = self.Xt[idx].copy()
+        imu, tof = self.aug(imu, tof)
+        xi = torch.from_numpy(imu)              # [L,C]
+        xt = torch.from_numpy(tof)              # [L,Ct,H,W]
+        yy = torch.tensor(self.y[idx], dtype=torch.long)
+        return xi, xt, yy
 
 
 # ------------------------------
@@ -897,9 +1084,6 @@ def collate_pad_tof(batch):
     return x_imu_pad, x_tof_pad, ys
 
 
-# ------------------------------
-# MixUp collate（IMU/ToF 両方ミックス）
-# ------------------------------
 def mixup_pad_collate_fn_tof(alpha: float = 0.2):
     if alpha <= 0:
         return collate_pad_tof
@@ -988,15 +1172,15 @@ class GestureDataModule(L.LightningDataModule):
 
         self.batch = cfg.train.batch_size
         self.batch_val = cfg.train.batch_size_val
-        self.num_workers = int(getattr(cfg.train, "num_workers", 4))
-        self.mixup_a = getattr(cfg.train, "mixup_alpha", 0.0)  # ここでは未使用（maskなしで固定長のため）
+        self.num_workers = cfg.train.num_workers
+        self.mixup_a = cfg.train.mixup_alpha
 
         # 固定長 & トリミング方針
         self.max_seq_len: Optional[int] = self.cfg.data.max_seq_len
-        self.pad_percentile: int = int(getattr(self.cfg.data, "pad_percentile", 95))
-        self.pad_value: float = float(getattr(self.cfg.data, "pad_value", 0.0))
-        self.truncate_mode_train: str = getattr(self.cfg.data, "truncate_mode_train", "random")  # random/head/tail/center
-        self.truncate_mode_val:   str = getattr(self.cfg.data, "truncate_mode_val",   "center")
+        self.pad_percentile: int = self.cfg.data.pad_percentile
+        self.pad_value: float = self.cfg.data.pad_value
+        self.truncate_mode_train: str = self.cfg.data.truncate_mode_train # random/head/tail/center
+        self.truncate_mode_val:   str = self.cfg.data.truncate_mode_val
 
         # 後で埋める
         self.num_classes: int = 0
@@ -1039,7 +1223,7 @@ class GestureDataModule(L.LightningDataModule):
         self.imu_ch = len(self.imu_cols)
 
         # ToF 形状
-        ct = int(getattr(self.cfg.data, "tof_in_channels", 5))
+        ct = self.cfg.data.tof_in_channels
         if getattr(self.cfg.data, "tof_hw", None) is not None:
             h, w = tuple(self.cfg.data.tof_hw)
             assert ct * h * w == len(self.tof_cols), "tof_hw と tof_cols 数が一致しません"
@@ -1112,8 +1296,27 @@ class GestureDataModule(L.LightningDataModule):
         ytr = np.asarray(ytr, dtype=np.int64)
         yva = np.asarray(yva, dtype=np.int64)
 
-        self._train_ds = FixedLenToFDataset(Xtr_imu, Xtr_tof, ytr)
-        self._val_ds   = FixedLenToFDataset(Xva_imu, Xva_tof, yva)
+        if self.cfg.aug.no_aug:
+            # Augmenter を使わない場合は素の Dataset
+            self._train_ds = FixedLenToFDataset(Xtr_imu, Xtr_tof, ytr)
+        else:
+            self._train_ds = FixedLenToFDatasetAug(Xtr_imu, Xtr_tof, ytr, 
+                AugmentIMUToF(
+                    p_time_shift=self.cfg.aug.p_time_shift, max_shift_ratio=self.cfg.aug.max_shift_ratio,
+                    p_time_warp=self.cfg.aug.p_time_warp, warp_min=self.cfg.aug.warp_min, warp_max=self.cfg.aug.warp_max,
+                    p_block_dropout=self.cfg.aug.p_block_dropout, n_blocks=self.cfg.aug.n_blocks, block_len=self.cfg.aug.block_len,
+                    p_imu_jitter=self.cfg.aug.p_imu_jitter, imu_sigma=self.cfg.aug.imu_sigma,
+                    p_imu_scale=self.cfg.aug.p_imu_scale, imu_scale_sigma=self.cfg.aug.imu_scale_sigma,
+                    p_imu_drift=self.cfg.aug.p_imu_drift, drift_std=self.cfg.aug.drift_std, drift_clip=self.cfg.aug.drift_clip,
+                    p_imu_small_rot=self.cfg.aug.p_imu_small_rot,   # 必要なら0.2程度に
+                    p_tof_ch_drop=self.cfg.aug.p_tof_ch_drop,
+                    p_tof_erasing=self.cfg.aug.p_tof_erasing, erase_hw=self.cfg.aug.erase_hw, n_erase=self.cfg.aug.n_erase,
+                    p_tof_shift=self.cfg.aug.p_tof_shift,
+                    p_tof_gain_noise=self.cfg.aug.p_tof_gain_noise, tof_gain=self.cfg.aug.tof_gain, tof_sigma=self.cfg.aug.tof_sigma,
+                    pad_value=self.cfg.aug.pad_value,
+                )
+            )
+        self._val_ds   = FixedLenToFDataset(Xva_imu, Xva_tof, yva)  # 検証は素通し
 
         # ---- class_weight & steps/epoch ----
         self.class_weight = torch.tensor(
