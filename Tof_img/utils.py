@@ -20,18 +20,18 @@ from torch.nn import init
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 from collections import Counter
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score, f1_score
 import lightning as L
 from torch.optim import Adam
 from torchmetrics.classification import MulticlassAccuracy
 
 from scipy.signal import cont2discrete
-from typing import Any, Optional, List, Tuple, Union
+from typing import Any, Optional, List, Tuple, Union, Callable
 import math
 import pathlib
 from pathlib import Path
 from hydra.core.hydra_config import HydraConfig
-from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, GroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
@@ -721,40 +721,84 @@ class litmodel(L.LightningModule):
             raise RuntimeError(f"Unexpected batch length: {n}")
 
     # ------------------------------------------------------------
-    def training_step(self, batch, batch_idx):
-        b = self._parse_batch(batch)
-        bs = b["x_imu"].size(0)
-
-        if b["is_mixup"]:
-            logits = self.forward(b["x_imu"], b["x_tof"])
-            loss = self.hparams.cls_loss_weight * (
-                b["lam"] * self._ce(logits, b["y"]) + (1.0 - b["lam"]) * self._ce(logits, b["y_b"])
-            )
-            preds = logits.argmax(dim=1)
-            acc   = b["lam"] * self._acc(preds, b["y"]) + (1.0 - b["lam"]) * self._acc(preds, b["y_b"])
+    # litmodel 内に追加
+    def _ce_per_sample(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # soft-label
+        if target.ndim == 2 and target.dtype != torch.long:
+            logp = F.log_softmax(logits, dim=1)
+            return -(target * logp).sum(dim=1)  # [B]
+        # hard-label
+        hard = target if target.ndim == 1 else target.argmax(dim=1)
+        if self.class_weight is not None:
+            ce = nn.CrossEntropyLoss(weight=self.class_weight, reduction='none')
         else:
-            logits = self.forward(b["x_imu"], b["x_tof"])
-            loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
-            preds  = logits.argmax(dim=1)
-            acc    = self._acc(preds, b["y"])
+            ce = nn.CrossEntropyLoss(reduction='none')
+        return ce(logits, hard)  # [B]
 
-        log_dict = {"train/loss": loss, "train/acc": acc}
-        opt = self.optimizers()
-        if opt is not None:
-            log_dict["lr"] = opt.param_groups[0]["lr"]
-        self.log_dict(log_dict, on_step=True, on_epoch=True, batch_size=bs)
+    def training_step(self, batch, batch_idx):
+        # mixup: (x_imu, x_tof, y_a, y_b, lam) / 普通: (x_imu, x_tof, y)
+        if len(batch) == 5:
+            x_imu, x_tof, y_a, y_b, lam = batch
+            logits = self.forward(x_imu, x_tof)
+            la = self._ce_per_sample(logits, y_a)  # [B]
+            lb = self._ce_per_sample(logits, y_b)  # [B]
+            loss = self.hparams.cls_loss_weight * (lam * la + (1.0 - lam) * lb).mean()
+            preds = logits.argmax(dim=1)
+            acc   = self._acc(preds, y_a)  # ここは代表として y_a を使用（指標の一致はvalで担保）
+        else:
+            x_imu, x_tof, y = batch
+            logits = self.forward(x_imu, x_tof)
+            loss   = self.hparams.cls_loss_weight * self._ce(logits, y)
+            preds  = logits.argmax(dim=1)
+            acc    = self._acc(preds, y)
+
+        self.log_dict({"train/loss": loss, "train/acc": acc,
+                    "lr": self.optimizers().param_groups[0]["lr"]}, on_step=True, on_epoch=True, batch_size=x_imu.size(0))
         return loss
 
-    # ------------------------------------------------------------
+    def to_binary(self, y): 
+        return [0 if i<9 else 1 for i in y]
+    def to_9class(self, y): 
+        return [i%9 for i in y]
+
+    def on_validation_epoch_start(self):
+        self._val_preds = []
+        self._val_trues = []
+
     def validation_step(self, batch, batch_idx):
-        b = self._parse_batch(batch)
-        bs = b["x_imu"].size(0)
-        logits = self.forward(b["x_imu"], b["x_tof"])
-        loss   = self.hparams.cls_loss_weight * self._ce(logits, b["y"])
-        preds  = logits.argmax(dim=1)
-        acc    = self._acc(preds, b["y"])
-        # Plateau を使うなら monitor: "val/loss" を推奨
-        self.log_dict({"val/loss": loss, "val/acc": acc}, on_step=False, on_epoch=True, prog_bar=True, batch_size=bs)
+        x_imu, x_tof, y = batch
+        if y.ndim == 2: y = y.argmax(dim=1)
+        logits = self.forward(x_imu, x_tof)
+        loss = self.hparams.cls_loss_weight * self._ce(logits, y)
+        preds = logits.argmax(dim=1)
+        self._val_preds.append(preds.cpu())
+        self._val_trues.append(y.cpu())
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True, batch_size=x_imu.size(0))
+        return loss
+
+    def on_validation_epoch_end(self):
+        preds = torch.cat(self._val_preds)
+        trues = torch.cat(self._val_trues)
+
+        acc18 = accuracy_score(trues, preds)
+        f118  = f1_score(trues, preds, average="macro")
+
+        tb_p, tb_t = torch.tensor(self.to_binary(preds)), torch.tensor(self.to_binary(trues))
+        acc2 = accuracy_score(tb_t, tb_p); f12 = f1_score(tb_t, tb_p, average="macro")
+
+        t9_p, t9_t = torch.tensor(self.to_9class(preds)), torch.tensor(self.to_9class(trues))
+        acc9 = accuracy_score(t9_t, t9_p); f19 = f1_score(t9_t, t9_p, average="macro")
+
+        f1_avg = (f12 + f19) / 2.0
+
+        self.log_dict({
+            "val/acc18": acc18, "val/f1_18": f118,
+            "val/acc_bin": acc2, "val/f1_bin": f12,
+            "val/acc_9": acc9,   "val/f1_9": f19,
+            "val/f1_avg": f1_avg,
+            "val/neg_f1_18": 1.0 - f118,   # Plateau 監視用（ベース合わせ）
+        }, prog_bar=True)
+
 
     def test_step(self, batch, batch_idx):
         b = self._parse_batch(batch)
@@ -808,11 +852,11 @@ class litmodel(L.LightningModule):
                 },
             }
 
+        # configure_optimizers の plateau 分岐
         elif self.cfg.scheduler.name in ("plateau", "reduce_on_plateau", "rop", "reduceplateau"):
             opt = torch.optim.Adam(adam_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
-
             sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, mode=self.cfg.scheduler.mode, factor=self.cfg.scheduler.factor, patience=self.cfg.scheduler.patience,
+                opt, mode="min", factor=self.cfg.scheduler.factor, patience=self.cfg.scheduler.patience,
                 threshold=self.cfg.scheduler.threshold, threshold_mode=self.cfg.scheduler.threshold_mode,
                 cooldown=self.cfg.scheduler.cooldown, min_lr=self.cfg.scheduler.min_lr_sched, eps=1e-8,
             )
@@ -820,7 +864,7 @@ class litmodel(L.LightningModule):
                 "optimizer": opt,
                 "lr_scheduler": {
                     "scheduler": sched,
-                    "monitor": self.cfg.scheduler.monitor,
+                    "monitor": "val/neg_f1_18",   # ★ここが重要★
                     "interval": "epoch",
                     "frequency": 1,
                     "reduce_on_plateau": True,
@@ -1071,66 +1115,89 @@ class FixedLenToFDatasetAug(FixedLenToFDataset):
         return xi, xt, yy
 
 
-# ------------------------------
-# collate: Pad + mask（IMU/ToF 両方）
-# ------------------------------
-def collate_pad_tof(batch):
+def make_collate_pad_tof(return_len_mask: bool = False, pad_value: float = 0.0) -> Callable:
     """
-    入力（サンプル単位）: (x_imu:[Ti,C], x_tof:[Ti,5,H,W], y)
-    出力（バッチ）:
-      x_imu_pad:[B,L,C], x_tof_pad:[B,L,5,H,W], lengths:[B], mask:[B,L], y:[B] or [B,C]
+    サンプル: (x_imu:[Ti,C], x_tof:[Ti,Ct,H,W], y)
+    返り値（return_len_mask=False）:
+        x_imu_pad:[B,L,C], x_tof_pad:[B,L,Ct,H,W], y:[B] or [B,C]
+    返り値（return_len_mask=True）:
+        上に加えて lengths:[B], mask:[B,L]（有効=1）
     """
-    xs_imu, xs_tof, ys = zip(*batch)
-    xs_imu = [torch.as_tensor(x, dtype=torch.float32) for x in xs_imu]
-    xs_tof = [torch.as_tensor(x, dtype=torch.float32) for x in xs_tof]
+    def _collate(batch):
+        xs_imu, xs_tof, ys = zip(*batch)
+        xs_imu = [torch.as_tensor(x, dtype=torch.float32) for x in xs_imu]
+        xs_tof = [torch.as_tensor(x, dtype=torch.float32) for x in xs_tof]
 
-    lengths = torch.tensor([x.shape[0] for x in xs_imu], dtype=torch.long)
-    B = len(xs_imu)
-    L = int(lengths.max().item())
+        lengths = torch.tensor([x.shape[0] for x in xs_imu], dtype=torch.long)
+        B = len(xs_imu)
+        L = int(lengths.max().item())
 
-    C_imu = xs_imu[0].shape[1]
-    C_tof, H, W = xs_tof[0].shape[1:]
+        C_imu = xs_imu[0].shape[1]
+        Ct, H, W = xs_tof[0].shape[1:]
 
-    # IMU pad
-    x_imu_pad = torch.zeros((B, L, C_imu), dtype=torch.float32)
-    # ToF pad
-    x_tof_pad = torch.zeros((B, L, C_tof, H, W), dtype=torch.float32)
+        x_imu_pad = torch.full((B, L, C_imu), pad_value, dtype=torch.float32)
+        x_tof_pad = torch.full((B, L, Ct, H, W), pad_value, dtype=torch.float32)
 
-    for i, (xi, xt) in enumerate(zip(xs_imu, xs_tof)):
-        Ti = xi.shape[0]
-        x_imu_pad[i, :Ti] = xi
-        x_tof_pad[i, :Ti] = xt
+        for i, (xi, xt) in enumerate(zip(xs_imu, xs_tof)):
+            Ti = xi.shape[0]
+            x_imu_pad[i, :Ti] = xi
+            x_tof_pad[i, :Ti] = xt
 
-    # y は [B] or [B,C] に整形
-    ys = torch.stack([torch.as_tensor(y) for y in ys])
-    return x_imu_pad, x_tof_pad, ys
+        y = torch.stack([torch.as_tensor(v) for v in ys])  # long or one-hotは元のまま
+
+        if return_len_mask:
+            mask = torch.arange(L).unsqueeze(0) < lengths.unsqueeze(1)  # [B,L] bool
+            mask = mask.to(torch.float32)
+            return x_imu_pad, x_tof_pad, y, lengths, mask
+        else:
+            return x_imu_pad, x_tof_pad, y
+
+    return _collate
 
 
-def mixup_pad_collate_fn_tof(alpha: float = 0.2):
+def mixup_pad_collate_fn_tof(alpha: float = 0.4, p: float = 0.5, pad_value: float = 0.0):
+    """
+    返り値: (x_imu_mix, x_tof_orig, y_a, y_b, lam)  ※ lam は [B] ベクトル
+    - IMUのみMixUp（ToFはmixしない）
+    - サンプル毎 lam ~ Beta(alpha, alpha) を引く（確率 p で適用）
+    - y は hard-label（long）で返す（Lightning側でsoft/hard両対応CEを使う前提）
+    """
+    base = make_collate_pad_tof(return_len_mask=False, pad_value=pad_value)
+
     if alpha <= 0:
-        return collate_pad_tof
+        # MixUpしない（Padだけ）
+        return base
 
     def _collate(batch):
-        x_imu, x_tof, y = collate_pad_tof(batch)
+        x_imu, x_tof, y = base(batch)      # x_imu:[B,L,C], x_tof:[B,L,Ct,H,W], y:[B] or [B,C]
+        if y.ndim != 1:
+            # one-hotで来た場合は hard に戻す（内部でソフト処理したいなら training_step側で対応してOK）
+            y = y.argmax(dim=1)
+
         B = x_imu.size(0)
-        perm = torch.randperm(B)
+        device = x_imu.device
 
-        lam = float(np.random.beta(alpha, alpha))
-        lam = max(lam, 1.0 - lam)  # 弱混合の抑制
+        perm = torch.randperm(B, device=device)
+        apply = (torch.rand(B, device=device) < p)  # 各サンプルで適用判定
 
-        x_imu_mix = lam * x_imu + (1.0 - lam) * x_imu[perm]
-        x_tof_mix = lam * x_tof + (1.0 - lam) * x_tof[perm]
+        lam = torch.ones(B, device=device, dtype=torch.float32)
+        lam_vals = torch.distributions.Beta(alpha, alpha).sample((int(apply.sum()),)).to(device)
+        lam[apply] = torch.maximum(lam_vals, 1.0 - lam_vals)  # 弱混合抑制
 
-        y_a, y_b = y, y[perm]
-        return x_imu_mix, x_tof_mix, y_a, y_b, lam
+        # ---- IMUのみMixUp（ToFそのまま）----
+        lam_imu = lam.view(B, 1, 1)  # [B,1,1]
+        x_imu = lam_imu * x_imu + (1.0 - lam_imu) * x_imu[perm]
 
-    return _collate 
+        y_a, y_b = y, y[perm]        # hard-label
+        return x_imu, x_tof, y_a, y_b, lam
+
+    return _collate
 
 def _select_cols(all_cols: list[str]) -> tuple[list[str], list[str], list[str]]:
     meta = {'gesture','gesture_int','sequence_type','behavior','orientation',
             'row_id','subject','phase','sequence_id','sequence_counter'}
     feat_cols = [c for c in all_cols if c not in meta]
-    imu_cols  = [c for c in feat_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+    imu_cols  = [c for c in feat_cols if not c.startswith("tof_")]
     tof_cols  = [c for c in feat_cols if c.startswith("tof_")]
     return feat_cols, imu_cols, tof_cols
 
@@ -1308,9 +1375,9 @@ class GestureDataModule(L.LightningDataModule):
         # ---- split（subject があれば StratifiedGroupKFold）----
         idx_all = np.arange(len(X_imu_list))
 
-        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
+        kf = GroupKFold(n_splits=self.n_splits, shuffle=True,
                                 random_state=self.cfg.data.random_seed)
-        tr_idx, val_idx = list(skf.split(idx_all, y_int))[self.fold_idx]
+        tr_idx, val_idx = list(kf.split(idx_all, y_int, groups=subjects))[self.fold_idx]
         classes_arr = np.array(classes).tolist()
 
         def pack(indices):
@@ -1389,6 +1456,7 @@ class GestureDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=(self.num_workers > 0),
+            collate_fn=mixup_pad_collate_fn_tof(alpha=self.mixup_a, p=self.cfg.train.mixup_prob, pad_value=self.pad_value)
         )
 
     def val_dataloader(self):
@@ -1399,4 +1467,5 @@ class GestureDataModule(L.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=(self.num_workers > 0),
+            collate_fn=mixup_pad_collate_fn_tof(alpha=0, p=0, pad_value=self.pad_value)
         )

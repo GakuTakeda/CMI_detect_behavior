@@ -3,41 +3,42 @@ data:
   raw_dir: ../data
   export_dir: output
   random_seed: 42
-  max_seq_len: 100
+  max_seq_len: null          # ★pad_percentile=95から自動決定（ベースと同じ）
   pad_percentile: 95
   pad_value: 0.0
-  truncate_mode_train: tail  # random/head/tail/center
-  truncate_mode_val: tail     # random/head/tail/center
+  truncate_mode_train: head  # ★長い系列は先頭から切る（ベースは [:pad_len] なのでhead）
+  truncate_mode_val: head    # ★検証も同様
   tof_in_channels: 5
   tof_null_thresh: null
 
 train:
-  batch_size: 128
-  batch_size_val: 128
-  mixup_alpha: 0.2
-  lr_init: 5e-4
-  min_lr: 1e-5
-  weight_decay: 3e-3
-  epochs: 70
-  warmup_epochs: 30
+  batch_size: 64             # ★BATCH_SIZE=64
+  batch_size_val: 64
+  mixup_alpha: 0.4           # ★Beta(0.4,0.4)
+  mixup_prob: 0.5            # ★IMUのみMixUpをp=0.5で（collate/training_step対応済み前提）
+  lr_init: 1e-3              # ★LR_INIT=1e-3
+  min_lr: 1e-6               # plateauでは未使用でもOK
+  weight_decay: 1e-4         # ★WD=1e-4
+  epochs: 100                # ★EPOCHS=100
+  warmup_epochs: 1           # plateauなら実質未使用
   device: cuda
-  patience: 40
+  patience: 20               # ★EarlyStopping(patience)=20（f1_avg監視前提）
   num_workers: 4
+
 scheduler:
-  # name: warmup_cosine    # ← これなら AdamW + WarmupCosine
-  name: plateau            # ← これなら Adam + ReduceLROnPlateau
-  monitor: val/acc    # Loss なら "val_loss"
-  mode: max                # Loss の時は "min"
+  name: plateau              # ★Adam + ReduceLROnPlateau
+  monitor: val/neg_f1_18     # ★(1 - F1_18) を監視＝ベースの scheduler.step(1 - f1_18) と一致
+  mode: min                  # ★最小化
   factor: 0.5
   patience: 3
-  threshold: 0.0005
+  threshold: 0.0
   threshold_mode: rel
   cooldown: 0
-  min_lr_sched: 1e-6
+  min_lr_sched: 0.0
   verbose: true
 
-imu_dim: null         # ← 実行時にセット（例: 9）
-num_classes: null     # ← 実行時にセット（例: 23）
+imu_dim: null                # 実行時にセット
+num_classes: null            # 実行時にセット
 
 tof:
   in_channels: 5
@@ -50,7 +51,7 @@ cnn:
   residual:
     out_channels: 48
     num_blocks: 2
-  share_branch: false   # true で全IMU軸のCNNを重み共有
+  share_branch: false        # ベース同等（各IMU軸で別ブランチ）
 
 rnn:
   hidden_size: 128
@@ -61,7 +62,7 @@ rnn:
 meta:
   proj_dim: 64
   dropout: 0.2
-  stats_per_channel: 5   
+  stats_per_channel: 5
 
 noise_std: 0.09
 

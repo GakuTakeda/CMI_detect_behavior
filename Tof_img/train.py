@@ -2,9 +2,10 @@
 import os, json, yaml
 import hydra, lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import torch
 import numpy as np
+import pandas as pd
 
 # 既存ユーティリティ
 from utils import litmodel, GestureDataModule, calc_f1, seed_everything
@@ -49,14 +50,14 @@ def run(cfg: DictConfig):
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         early_stop = EarlyStopping(
-            monitor="val/acc",
+            monitor="val/f1_avg",
             patience=cfg.train.patience,
             mode="max",
         )
         checkpoint = ModelCheckpoint(
             dirpath=ckpt_dir,
             filename=f"best_of_fold_tinycnn_{fold+1}",
-            monitor="val/acc",
+            monitor="val/f1_avg",
             save_top_k=1,
             mode="max",
         )
@@ -118,9 +119,14 @@ def run(cfg: DictConfig):
             json.dump(scores, f, indent=2, ensure_ascii=False)
 
         print("Fold scores:", scores)
+        pd.DataFrame({"true": solution, "pred": submission}).to_csv(
+            dm.export_dir / f"val_preds_fold_{fold+1}.csv", index=False
+        )
+        del trainer, model
+        torch.cuda.empty_cache()
 
-    with open(os.path.join(dm.export_dir, "config.yaml"), "w", encoding="utf-8") as f:
-        yaml.dump(cfg, f, indent=2, allow_unicode=True, sort_keys=False)
+    with open(os.path.join(dm.export_dir, "config_resolved.yaml"), "w", encoding="utf-8") as f:
+        f.write(OmegaConf.to_yaml(cfg))
 
 if __name__ == "__main__":
     run()
