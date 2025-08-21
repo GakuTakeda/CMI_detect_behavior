@@ -19,6 +19,7 @@ from typing import Sequence
 from torch.nn import init
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+from collections import Counter
 from sklearn.metrics import f1_score
 import lightning as L
 from torch.optim import Adam
@@ -36,6 +37,32 @@ from sklearn.utils.class_weight import compute_class_weight
 import joblib
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import json
+
+def plot_val_gesture_distribution(val_dict, topn=None, save_path=None, title="Validation gesture distribution"):
+    # 1) 件数カウント
+    gestures = [d["gesture"] for d in val_dict.values()]
+    counts = Counter(gestures)
+
+    # 2) 件数・割合の表
+    df = pd.DataFrame(counts.items(), columns=["gesture", "count"]).sort_values("count", ascending=False)
+    df["pct"] = df["count"] / df["count"].sum() * 100
+
+    # 3) 可視化（横棒。ラベルが長くても見やすい）
+    plot_df = df if topn is None else df.head(topn)
+    plt.figure(figsize=(8, 0.45 * len(plot_df) + 1))
+    plt.barh(plot_df["gesture"], plot_df["count"])
+    plt.gca().invert_yaxis()  # 上を最大に
+    for i, (c, p) in enumerate(zip(plot_df["count"], plot_df["pct"])):
+        plt.text(c, i, f" {int(c)} ({p:.1f}%)", va="center")
+    plt.xlabel("count")
+    plt.title(title)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.show()
+
+    return df  # 集計表（全クラス）を返す
+
 
 class calc_f1:
     def __init__(self):
@@ -418,7 +445,7 @@ class ResidualSEBlock(nn.Module):
         self.shortcut = nn.Conv1d(in_ch, out_ch, 1) if in_ch!=out_ch else nn.Identity()
         self.bn_sc = nn.BatchNorm1d(out_ch) if in_ch!=out_ch else nn.Identity()
         self.se = SEBlock(out_ch)
-        self.pool = nn.MaxPool1d(pool_size)
+        self.pool = nn.MaxPool1d(pool_size) if pool_size and pool_size>1 else nn.Identity()
         self.drop = nn.Dropout(drop)
     def forward(self, x):
         res = self.bn_sc(self.shortcut(x))
@@ -426,8 +453,9 @@ class ResidualSEBlock(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))
         x = self.se(x)
         x = F.relu(x + res)
-        x = self.pool(x)
+        x = self.pool(x)  # pool が Identity なら時間長は維持
         return self.drop(x)
+
 
 class AttentionLayer(nn.Module):
     def __init__(self, d_model):
@@ -786,7 +814,7 @@ class litmodel(L.LightningModule):
             sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 opt, mode=self.cfg.scheduler.mode, factor=self.cfg.scheduler.factor, patience=self.cfg.scheduler.patience,
                 threshold=self.cfg.scheduler.threshold, threshold_mode=self.cfg.scheduler.threshold_mode,
-                cooldown=self.cfg.scheduler.cooldown, min_lr=self.cfg.scheduler.min_lr_sched, eps=1e-8, verbose=self.cfg.scheduler.verbose
+                cooldown=self.cfg.scheduler.cooldown, min_lr=self.cfg.scheduler.min_lr_sched, eps=1e-8,
             )
             return {
                 "optimizer": opt,
@@ -1221,7 +1249,7 @@ class GestureDataModule(L.LightningDataModule):
                 total = int(tof_np.size)
                 nulls = int(np.count_nonzero(tof_np == -1))
                 frac = (nulls / total) if total > 0 else 1.0
-                if frac >= self.tof_null_thresh:
+                if frac >= self.cfg.data.tof_null_thresh:
                     bad_ids.append(sid)
                     drop_info.append((sid, nulls, total, frac))
             if bad_ids:
@@ -1229,10 +1257,13 @@ class GestureDataModule(L.LightningDataModule):
                 df = df[~df["sequence_id"].isin(bad_ids)].copy()
                 pd.DataFrame(drop_info, columns=["sequence_id", "n_null", "n_total", "null_frac"])\
                   .to_csv(self.export_dir / "dropped_sequences_tof_null.csv", index=False)
-                print(f"[DataModule] Dropped {len(bad_ids)} sequences by ToF null ratio >= {self.tof_null_thresh}")
+                print(f"[DataModule] Dropped {len(bad_ids)} sequences by ToF null ratio >= {self.cfg.data.tof_null_thresh}")
 
         # スケール適用
-        df_feat = df[self.feat_cols].ffill().bfill().fillna(0)
+        df_feat = df[self.feat_cols].copy()
+        df_feat = df_feat.replace(-1, 0).fillna(0)
+        df_feat = df_feat.mask(df_feat == 0, 1e-3)
+        df[self.feat_cols] = df_feat
         df[self.feat_cols] = scaler.transform(df_feat.values)
 
         # ---- シーケンス毎に numpy へ ----
@@ -1277,9 +1308,9 @@ class GestureDataModule(L.LightningDataModule):
         # ---- split（subject があれば StratifiedGroupKFold）----
         idx_all = np.arange(len(X_imu_list))
 
-        sgkf = StratifiedGroupKFold(n_splits=self.n_splits, shuffle=True,
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
                                 random_state=self.cfg.data.random_seed)
-        tr_idx, val_idx = list(sgkf.split(idx_all, y_int, subjects))[self.fold_idx]
+        tr_idx, val_idx = list(skf.split(idx_all, y_int))[self.fold_idx]
         classes_arr = np.array(classes).tolist()
 
         def pack(indices):
@@ -1299,6 +1330,8 @@ class GestureDataModule(L.LightningDataModule):
         # JSON
         with open(self.export_dir / f"seq_split_fold{self.fold_idx}.json", "w", encoding="utf-8") as f:
             json.dump(split_map, f, ensure_ascii=False, indent=2)
+
+        plot_val_gesture_distribution(split_map["val"], save_path=self.export_dir / f"val_gesture_dist_fold_{self.fold_idx}.png")
 
         Xtr_imu, Xtr_tof, ytr = [], [], []
         for i in tr_idx:

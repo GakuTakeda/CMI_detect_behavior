@@ -1,5 +1,5 @@
 # cv_main_tinycnn.py
-import os, json
+import os, json, yaml
 import hydra, lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from omegaconf import DictConfig
@@ -119,6 +119,8 @@ def run(cfg: DictConfig):
 
         print("Fold scores:", scores)
 
+    with open(os.path.join(dm.export_dir, "config.yaml"), "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, indent=2, allow_unicode=True, sort_keys=False)
 
 if __name__ == "__main__":
     run()

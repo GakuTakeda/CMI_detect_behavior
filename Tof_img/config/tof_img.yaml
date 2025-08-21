@@ -3,38 +3,38 @@ data:
   raw_dir: ../data
   export_dir: output
   random_seed: 42
-  max_seq_len: null
+  max_seq_len: 100
   pad_percentile: 95
   pad_value: 0.0
   truncate_mode_train: tail  # random/head/tail/center
   truncate_mode_val: tail     # random/head/tail/center
   tof_in_channels: 5
-  tof_null_thresh: 250
+  tof_null_thresh: null
 
 train:
   batch_size: 128
   batch_size_val: 128
-  mixup_alpha: 0.0
+  mixup_alpha: 0.2
   lr_init: 5e-4
   min_lr: 1e-5
   weight_decay: 3e-3
-  epochs: 100
+  epochs: 70
   warmup_epochs: 30
   device: cuda
   patience: 40
   num_workers: 4
-  scheduler:
-    # name: warmup_cosine    # ← これなら AdamW + WarmupCosine
-    name: plateau            # ← これなら Adam + ReduceLROnPlateau
-    monitor: val_acc    # Loss なら "val_loss"
-    mode: max                # Loss の時は "min"
-    factor: 0.5
-    patience: 3
-    threshold: 0.0005
-    threshold_mode: rel
-    cooldown: 0
-    min_lr: 1e-6
-    verbose: true
+scheduler:
+  # name: warmup_cosine    # ← これなら AdamW + WarmupCosine
+  name: plateau            # ← これなら Adam + ReduceLROnPlateau
+  monitor: val/acc    # Loss なら "val_loss"
+  mode: max                # Loss の時は "min"
+  factor: 0.5
+  patience: 3
+  threshold: 0.0005
+  threshold_mode: rel
+  cooldown: 0
+  min_lr_sched: 1e-6
+  verbose: true
 
 imu_dim: null         # ← 実行時にセット（例: 9）
 num_classes: null     # ← 実行時にセット（例: 23）
