@@ -10,7 +10,7 @@ data:
   max_seq_len: null          # pad_percentile から自動決定
   pad_percentile: 95
   pad_value: 0.0
-  truncate_mode_train: head  # 長い系列は先頭から切る
+  truncate_mode_train: random  # 長い系列は先頭から切る
   truncate_mode_val: head
 
 train:
@@ -27,6 +27,7 @@ train:
   devices: 1
   precision: "32-true"
   patience: 30               # EarlyStopping(patience)
+  num_workers: 4
 
 scheduler:
   name: plateau              # Adam + ReduceLROnPlateau（monitorはコード側で val/neg_f1_18）
@@ -37,7 +38,6 @@ scheduler:
   cooldown: 0
   min_lr_sched: 0.0
 
-# 実行時にDataModuleから上書きされる
 imu_dim: null
 num_classes: null
 

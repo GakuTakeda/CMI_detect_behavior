@@ -58,7 +58,6 @@ def run(cfg: DictConfig):
             lr_init=cfg.train.lr_init,
             min_lr=cfg.train.min_lr,
             weight_decay=cfg.train.weight_decay,
-            class_weight=dm.class_weight,
         )
 
         # ---- コールバック / Trainer ----
@@ -72,7 +71,7 @@ def run(cfg: DictConfig):
         )
         checkpoint = ModelCheckpoint(
             dirpath=ckpt_dir,
-            filename=f"best_of_fold_tinycnn_{fold+1}",
+            filename=f"best_of_fold_imu_{fold+1}",
             monitor="val/f1_avg",
             save_top_k=1,
             mode="max",
@@ -110,7 +109,6 @@ def run(cfg: DictConfig):
             lr_init=cfg.train.lr_init,
             min_lr=cfg.train.min_lr,
             weight_decay=cfg.train.weight_decay,
-            class_weight=dm.class_weight,
         ).to(device)
         model.eval()
 

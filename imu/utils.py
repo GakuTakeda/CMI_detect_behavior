@@ -731,10 +731,6 @@ class litmodel(L.LightningModule):
         else:
             raise ValueError(f"Unknown scheduler name: {self.cfg.scheduler.name}")
 
-# =========================================================
-# DataModule（IMU のみ）
-# =========================================================
-
 def _select_imu_cols(all_cols: list[str]) -> list[str]:
     meta = {'gesture','gesture_int','sequence_type','behavior','orientation',
             'row_id','subject','phase','sequence_id','sequence_counter'}
@@ -803,9 +799,17 @@ class GestureDataModule(L.LightningDataModule):
 
         # スケール（IMU のみ）
         df_feat = df[self.imu_cols].copy()
-        df_feat = df_feat.replace(-1, 0).fillna(0)
-        df_feat = df_feat.mask(df_feat == 0, 1e-3)
-        df[self.imu_cols] = scaler.transform(df_feat.values)
+
+        ff = df_feat.groupby(df["sequence_id"]).ffill()
+        bf = df_feat.groupby(df["sequence_id"]).bfill()
+
+        df_feat_interp = (ff + bf) / 2.0          # 基本は前後平均
+        df_feat_interp = df_feat_interp.fillna(ff)  # 片側しか無いときは片側
+        df_feat_interp = df_feat_interp.fillna(bf)  # それでも無いならもう片側
+        df_feat_interp = df_feat_interp.fillna(0.0) # まだNaNなら0で埋め
+
+        # スケール適用
+        df[self.imu_cols] = scaler.transform(df_feat_interp.values)
 
         # ---- シーケンス毎に numpy へ ----
         X_imu_list: List[np.ndarray] = []
@@ -818,8 +822,7 @@ class GestureDataModule(L.LightningDataModule):
 
         for sid, seq in df.groupby("sequence_id"):
             imu = seq[self.imu_cols].to_numpy(dtype=np.float32, copy=False)  # [T, C_imu]
-            T = imu.shape[0]
-            lengths.append(T)
+            lengths.append(imu.shape[0])
             X_imu_list.append(imu)
             y_list.append(int(seq["gesture_int"].iloc[0]))
             subjects.append(seq[subj_col].iloc[0] if subj_col else int(sid))
