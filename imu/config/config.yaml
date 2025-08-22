@@ -1,51 +1,117 @@
-train:
-  batch_size: 128
-  batch_size_val: 256
-  epochs: 70
-  lr_init: 1e-3
-  weight_decay: 1e-4
-  mixup_alpha: 0.4
-  mixup_prob: 0.5
-  patience: 30
-  t0_factor: 5            # CosineAnnealingWarmRestarts の T_0 係数
-  device: auto
-  devices: 1
-  precision: 32-true
+# =========================
+# IMU-only config (tof_img.yaml)
+# =========================
 
 data:
+  n_splits: 5
   raw_dir: ../data
   export_dir: output
+  random_seed: 42
+  max_seq_len: null          # pad_percentile から自動決定
   pad_percentile: 95
-  pad_len: null
-  random_seed : 42
-  n_splits: 5
+  pad_value: 0.0
+  truncate_mode_train: head  # 長い系列は先頭から切る
+  truncate_mode_val: head
 
+train:
+  batch_size: 64
+  batch_size_val: 64
+  mixup_alpha: 0.4           # Beta(0.4, 0.4)
+  mixup_prob: 0.5            # IMUのみMixUpを p=0.5
+  lr_init: 1e-3
+  min_lr: 1e-6
+  weight_decay: 1e-4
+  epochs: 100
+  warmup_epochs: 1
+  device: cuda
+  devices: 1
+  precision: "32-true"
+  patience: 30               # EarlyStopping(patience)
+
+scheduler:
+  name: plateau              # Adam + ReduceLROnPlateau（monitorはコード側で val/neg_f1_18）
+  factor: 0.5
+  patience: 3
+  threshold: 0.0
+  threshold_mode: rel
+  cooldown: 0
+  min_lr_sched: 0.0
+
+# 実行時にDataModuleから上書きされる
+imu_dim: null
 num_classes: null
-num_channels: null
-model:
-  meta:
-    proj_dim: 32
-    dropout: 0.20
 
-  cnn:
-    multiscale:
-      out_per_kernel: 12        # 12 × len([3,5,7]) = 36ch をコード側で算出
-      kernel_sizes: [3, 5, 7]
-    se:
-      out_channels: 48          # 各チャンネル枝の最終出力チャネル
-      drop: 0.30
-      
-    pool_sizes: [2, 2]        # MaxPool1d を2回通す想定 → L_out ≈ floor(L/4)
+cnn:
+  multiscale:
+    kernel_sizes: [3, 5, 7]
+    out_per_kernel: 12
+  residual:
+    out_channels: 48
+    num_blocks: 2
+  share_branch: false
 
-  rnn:
-    hidden_size: 128
-    num_layers: 2
-    dropout: 0.20
-    bidirectional: true
+rnn:
+  hidden_size: 128
+  num_layers: 2
+  bidirectional: true
+  dropout: 0.2
 
-  noise:
-    std: 0.09
+meta:
+  proj_dim: 64
+  dropout: 0.2
+  stats_per_channel: 5
 
-  head:
-    hidden: 512
-    dropout: 0.50
+noise_std: 0.09
+
+head:
+  hidden: 512
+  dropout: 0.5
+
+aug:
+  no_aug: true
+
+  # 時間方向
+  p_time_shift: 0.7
+  max_shift_ratio: 0.1
+  p_time_warp: 0.5
+  warp_min: 0.9
+  warp_max: 1.1
+  p_block_dropout: 0.5
+  n_blocks: [1, 2]
+  block_len: [2, 5]
+
+  # IMU系
+  p_imu_jitter: 0.9
+  imu_sigma: 0.03
+  p_imu_scale: 0.5
+  imu_scale_sigma: 0.03
+  p_imu_drift: 0.5
+  drift_std: 0.003
+  drift_clip: 0.25
+  p_imu_small_rot: 0.0   # 使うなら 0.2 など
+  rot_deg: 5.0
+
+  pad_value: 0.0
+
+
+# ---- 拡張を完全OFFにしたい場合の例（IMU-only版） ----
+# aug:
+#   no_aug: false
+#   p_time_shift: 0.0
+#   max_shift_ratio: 0.0
+#   p_time_warp: 0.0
+#   warp_min: 1.0
+#   warp_max: 1.0
+#   p_block_dropout: 0.0
+#   n_blocks: [0, 0]
+#   block_len: [0, 0]
+#   p_imu_jitter: 0.0
+#   imu_sigma: 0.0
+#   p_imu_scale: 0.0
+#   imu_scale_sigma: 0.0
+#   p_imu_drift: 0.0
+#   drift_std: 0.0
+#   drift_clip: 0.0
+#   p_imu_small_rot: 0.0
+#   rot_deg: 0.0
+#   pad_value: 0.0
