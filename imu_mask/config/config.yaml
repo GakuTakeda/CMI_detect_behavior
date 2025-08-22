@@ -1,0 +1,4 @@
+defaults:
+  - data: cmi
+  - model: two_branch
+  - train: default

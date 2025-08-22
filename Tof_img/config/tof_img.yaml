@@ -22,7 +22,7 @@ train:
   epochs: 100                # ★EPOCHS=100
   warmup_epochs: 1           # plateauなら実質未使用
   device: cuda
-  patience: 20               # ★EarlyStopping(patience)=20（f1_avg監視前提）
+  patience: 30               # ★EarlyStopping(patience)=20（f1_avg監視前提）
   num_workers: 4
 
 scheduler:
@@ -51,7 +51,7 @@ cnn:
   residual:
     out_channels: 48
     num_blocks: 2
-  share_branch: false        # ベース同等（各IMU軸で別ブランチ）
+  share_branch: false        
 
 rnn:
   hidden_size: 128
@@ -105,3 +105,46 @@ aug:
   tof_sigma: 0.01
 
   pad_value: 0.0
+
+
+# aug:
+#   no_aug: false  # ← ここは false のままでも、下をこの値にすれば拡張は掛からない
+#
+#   # 時間方向
+#   p_time_shift: 0.0
+#   max_shift_ratio: 0.0
+#   p_time_warp: 0.0
+#   warp_min: 1.0
+#   warp_max: 1.0
+#   p_block_dropout: 0.0
+#   n_erase: [0, 0]      # 任意（p=0なら影響なし）
+#   n_blocks: [0, 0]     # 任意（p=0なら影響なし）
+#   block_len: [0, 0]    # 任意
+#
+#   # IMU系
+#   p_imu_jitter: 0.0
+#   imu_sigma: 0.0
+#   p_imu_scale: 0.0
+#   imu_scale_sigma: 0.0
+#   p_imu_drift: 0.0
+#   drift_std: 0.0
+#   drift_clip: 0.0
+#   p_imu_small_rot: 0.0
+#   rot_deg: 0.0
+#
+#   # ToF系
+#   p_tof_ch_drop: 0.0
+#   p_tof_erasing: 0.0
+#   erase_hw: [[0, 0], [0, 0]]  # 任意（p=0なら影響なし）
+#   n_erase: [0, 0]
+#   p_tof_shift: 0.0
+#   p_tof_gain_noise: 0.0
+#   tof_gain: [1.0, 1.0]
+#   tof_sigma: 0.0
+#
+#   # その他
+#   pad_value: 0.0  # 使われないがそのままでOK
+#
+# # （MixUpも完全に無効化したい場合）
+# # train:
+# #   mixup_alpha: 0.0

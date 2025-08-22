@@ -3,25 +3,40 @@ import os, json, yaml
 import hydra, lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from omegaconf import DictConfig, OmegaConf
+from lightning.pytorch.loggers import TensorBoardLogger
 import torch
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from hydra.core.hydra_config import HydraConfig
+import warnings
+warnings.filterwarnings("ignore")   
 
 # 既存ユーティリティ
 from utils import litmodel, GestureDataModule, calc_f1, seed_everything
 
-
+avg = []
 @hydra.main(config_path="config", config_name="tof_img", version_base="1.3")
 def run(cfg: DictConfig):
     # 再現性
     seed_everything(cfg.data.random_seed)
     scorer = calc_f1()
 
+    run_dir = Path(HydraConfig.get().runtime.output_dir)  # .../YYYY-MM-DD/HH-MM-SS
+    date_part = run_dir.parent.name                       # YYYY-MM-DD
+    time_part = run_dir.name                              # HH-MM-SS
+
     n_splits = cfg.data.n_splits
     print(f"CV n_splits = {n_splits}")
 
     for fold in range(n_splits):
         print(f"\n===== Fold {fold} / {n_splits-1} =====")
+        tb_logger = TensorBoardLogger(
+            save_dir=str(run_dir),        # 例: outputs/tof_img/2025-08-22/09-05-11
+            name="tb",                    # 例: .../tb/
+            version=f"{date_part}_{time_part}_fold{fold+1}",  # 例: .../tb/2025-08-22_09-05-11_fold1
+            default_hp_metric=False,
+        )
 
         # ---- DataModule 準備（固定長化は DataModule 内で完結・mask なし）----
         dm = GestureDataModule(cfg, fold_idx=fold)
@@ -70,6 +85,7 @@ def run(cfg: DictConfig):
             gradient_clip_val=1.0,
             callbacks=[early_stop, checkpoint],
             log_every_n_steps=50,
+            logger=tb_logger,
         )
 
         # ---- 学習 ----
@@ -117,6 +133,7 @@ def run(cfg: DictConfig):
         }
         with open(dm.export_dir / f"scores_{fold+1}.json", "w", encoding="utf-8") as f:
             json.dump(scores, f, indent=2, ensure_ascii=False)
+        avg.append(scores[f"binary_score_of_fold_{fold+1}_tinycnn"] + scores[f"macro_score_of_fold_{fold+1}_tinycnn"])
 
         print("Fold scores:", scores)
         pd.DataFrame({"true": solution, "pred": submission}).to_csv(
@@ -127,6 +144,9 @@ def run(cfg: DictConfig):
 
     with open(os.path.join(dm.export_dir, "config_resolved.yaml"), "w", encoding="utf-8") as f:
         f.write(OmegaConf.to_yaml(cfg))
+    print("Average scores across folds:", np.mean(avg))
+    with open(dm.export_dir / "avg_scores.json", "w", encoding="utf-8") as f:
+        json.dump({"average_score": np.mean(avg)}, f, indent=2, ensure_ascii=False)
 
 if __name__ == "__main__":
     run()

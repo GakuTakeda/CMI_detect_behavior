@@ -1,4 +1,51 @@
-defaults:
-  - data: cmi
-  - model: two_branch
-  - train: default
+train:
+  batch_size: 128
+  batch_size_val: 256
+  epochs: 70
+  lr_init: 1e-3
+  weight_decay: 1e-4
+  mixup_alpha: 0.4
+  mixup_prob: 0.5
+  patience: 30
+  t0_factor: 5            # CosineAnnealingWarmRestarts の T_0 係数
+  device: auto
+  devices: 1
+  precision: 32-true
+
+data:
+  raw_dir: ../data
+  export_dir: output
+  pad_percentile: 95
+  pad_len: null
+  random_seed : 42
+  n_splits: 5
+
+num_classes: null
+num_channels: null
+model:
+  meta:
+    proj_dim: 32
+    dropout: 0.20
+
+  cnn:
+    multiscale:
+      out_per_kernel: 12        # 12 × len([3,5,7]) = 36ch をコード側で算出
+      kernel_sizes: [3, 5, 7]
+    se:
+      out_channels: 48          # 各チャンネル枝の最終出力チャネル
+      drop: 0.30
+      
+    pool_sizes: [2, 2]        # MaxPool1d を2回通す想定 → L_out ≈ floor(L/4)
+
+  rnn:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.20
+    bidirectional: true
+
+  noise:
+    std: 0.09
+
+  head:
+    hidden: 512
+    dropout: 0.50

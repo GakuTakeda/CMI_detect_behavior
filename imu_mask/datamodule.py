@@ -2,15 +2,15 @@
 import numpy as np, pandas as pd, torch, joblib, pathlib
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedGroupKFold, GroupKFold
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
-from utils import (preprocess_sequence, SequenceDatasetFixedLen,
-                   mixup_fixed_collate_fn, collate_fixed,
-                     feature_eng, Augment, labeling, labeling_for_macro, )
+from utils import (preprocess_sequence, SequenceDatasetVarLen, 
+                   mixup_pad_collate_fn, collate_pad, feature_eng, Augment, labeling, labeling_for_macro)
 from sklearn.utils.class_weight import compute_class_weight
 from hydra.core.hydra_config import HydraConfig
 import math
+
 
 
 class GestureDataModule(L.LightningDataModule):
@@ -25,11 +25,7 @@ class GestureDataModule(L.LightningDataModule):
         self.batch      = cfg.train.batch_size
         self.batch_val  = cfg.train.batch_size_val
         self.mixup_a    = cfg.train.mixup_alpha
-        self.mixup_p    = cfg.train.mixup_prob  # MixUp の確率
 
-        # オプション: cfg.data.pad_len を用意していなければ None のまま → setup で自動決定
-        self.pad_len    = cfg.data.pad_len
-        
     def prepare_data(self):
         df = pd.read_csv(self.raw_dir / "train.csv")
         df = feature_eng(df)
@@ -66,35 +62,30 @@ class GestureDataModule(L.LightningDataModule):
 
         scaler = joblib.load(self.export_dir/"scaler.pkl")
 
-        # ---- 全シーケンスを読み込み（可変長のままテンソル化）----
-        X_list, y_int, lengths, subjects = [], [], [], []
+        # ---- 全シーケンスを「可変長のまま」作る ----
+        X_list, y_int, lengths, subjects = [], [], [], []   # ← subjects を追加
         for _, seq in df.groupby("sequence_id"):
             x_all = preprocess_sequence(seq, feat_cols, scaler)  # [T, F]
-            x_imu = x_all[:, imu_idx].to(torch.float32)          # [T, C_imu]
+            x_imu = x_all[:, imu_idx].to(torch.float32)         # [T, C_imu]
             X_list.append(x_imu)
             y_int.append(int(seq["gesture_int"].iloc[0]))
             lengths.append(x_imu.shape[0])
-            subjects.append(seq["subject"].iloc[0])
+            subjects.append(seq["subject"].iloc[0]) 
 
         y_int = np.array(y_int)
-        lengths = np.asarray(lengths)
 
-        # ---- pad_len の決定（cfg 指定なければ95%タイル）----
-        if self.pad_len is None or int(self.pad_len) <= 0:
-            self.pad_len = int(np.percentile(lengths, self.cfg.data.pad_percentile))
-            # 念のため下限
-            self.pad_len = max(self.pad_len, 16)
-            np.save(self.export_dir / "sequence_maxlen.npy", self.pad_len)
-        
-        X_pad = np.zeros((len(X_list), self.pad_len, self.imu_ch),
-                         dtype="float32")
-        for i, m in enumerate(X_list):
-            X_pad[i, :min(len(m), self.pad_len)] = m[:self.pad_len]
+        # ---- StratifiedGroupKFold（subject でグループ、y_processed で層化）----
+        sgkf = StratifiedGroupKFold(
+            n_splits=self.n_splits,
+            shuffle=True,                
+            random_state=self.cfg.data.random_seed
+        )
 
-        # ---- StratifiedGroupKFold（subject でグループ、y_int で層化）----
-        kf = GroupKFold(n_splits=self.n_splits, shuffle=True,
-                                random_state=self.cfg.data.random_seed)
-        tr_idx, val_idx = list(kf.split(X_pad, y_int, groups=subjects))[self.fold_idx]
+        # fold_idx 番目を取得
+        tr_idx, val_idx = list(
+            sgkf.split(X=np.arange(len(X_list)), y=y_int, groups=np.array(subjects))
+        )[self.fold_idx]
+
 
         # ---- Augmenter（任意：IMUのみ）----
         self.augmenter = Augment(
@@ -104,39 +95,38 @@ class GestureDataModule(L.LightningDataModule):
             p_moda=0.391, drift_std=0.004, drift_max=0.393
         )
 
-        # ---- Dataset（固定長）----
-        X_tr  = [X_pad[i] for i in tr_idx]
-        X_val = [X_pad[i] for i in val_idx]
-        y_tr  = y_int[tr_idx]
+        # ---- Dataset（可変長）----
+        X_tr = [X_list[i] for i in tr_idx]
+        X_val = [X_list[i] for i in val_idx]
+        y_tr = y_int[tr_idx]
         y_val = y_int[val_idx]
 
-        # 学習は augment あり、検証は augment なし
-        self.ds_tr_imu  = SequenceDatasetFixedLen(X_tr,  y_tr, self.num_classes, self.mixup_a, self.mixup_p)
-        self.ds_val_imu = SequenceDatasetFixedLen(X_val, y_val, self.num_classes, self.mixup_a, self.mixup_p)
+        self.ds_tr_imu  = SequenceDatasetVarLen(X_tr, y_tr, augmenter=None)
+        self.ds_val_imu = SequenceDatasetVarLen(X_val, y_val, augmenter=None)
 
         # ---- class_weight（fold内）----
         self.class_weight = compute_class_weight(
             class_weight="balanced",
             classes=np.arange(self.num_classes),
-            y=y_tr
+            y=y_int[tr_idx]
         )
         self.steps_per_epoch = math.ceil(len(tr_idx) / self.batch)
 
     # ---------- DataLoaders ----------
     def train_dataloader_imu(self):
-        # ハードラベル MixUp：y_a, y_b, lam を返す
+        # ハードラベルMixUp（推奨）：y_a, y_b, lam を返す
         return DataLoader(
             self.ds_tr_imu,
             batch_size=self.batch, shuffle=True,
-            collate_fn=mixup_fixed_collate_fn(self.mixup_a, return_soft=False),
+            collate_fn=mixup_pad_collate_fn(self.mixup_a, return_soft=False),
             drop_last=True, num_workers=4, pin_memory=True, persistent_workers=True
         )
 
     def val_dataloader_imu(self):
-        # 検証は MixUp なし
+        # 検証はMixUpなし、Pad+Maskのみ
         return DataLoader(
             self.ds_val_imu,
-            batch_size=self.batch_val, shuffle=False,
-            collate_fn=collate_fixed,
+            batch_size=self.batch_val,
+            collate_fn=collate_pad,
             num_workers=4, pin_memory=True, persistent_workers=True
         )
