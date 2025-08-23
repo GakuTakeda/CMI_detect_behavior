@@ -13,7 +13,7 @@ import random
 import math
 from pathlib import Path
 from hydra.core.hydra_config import HydraConfig
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import accuracy_score, f1_score
 import joblib
@@ -169,27 +169,83 @@ def calculate_angular_distance(rot_data):
             angular_dist[i] = 0
     return angular_dist
 
+def remove_gravity_from_acc(acc_data, rot_data):
+    if isinstance(acc_data, pd.DataFrame):
+        acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values
+    else:
+        acc_values = acc_data
+
+    if isinstance(rot_data, pd.DataFrame):
+        quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values
+    else:
+        quat_values = rot_data
+
+    num_samples = acc_values.shape[0]
+    linear_accel = np.zeros_like(acc_values)
+    gravity_world = np.array([0, 0, 9.81])
+    for i in range(num_samples):
+        if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
+            linear_accel[i, :] = acc_values[i, :] 
+            continue
+
+        try:
+            rotation = R.from_quat(quat_values[i])
+            gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
+            linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
+        except ValueError:
+             linear_accel[i, :] = acc_values[i, :]
+             
+    return linear_accel
 
 def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    IMU のみを対象に、軽い特徴量を追加（列の並び替えはしない）。
-    ToF/THM 列が存在しても無視する。
-    """
-    df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
-    df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1, 1))
-    df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
-    df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
-    rot_data = df[['rot_x', 'rot_y', 'rot_z', 'rot_w']]
-    ang_v = calculate_angular_velocity_from_quat(rot_data)
-    df['angular_vel_x'] = ang_v[:, 0]
-    df['angular_vel_y'] = ang_v[:, 1]
-    df['angular_vel_z'] = ang_v[:, 2]
-    df['angular_dist'] = calculate_angular_distance(rot_data)
+    df["acc_mag"] = np.sqrt(df["acc_x"]**2 + df["acc_y"]**2 + df["acc_z"]**2)
+    df["rot_angle"] = 2 * np.arccos(df["rot_w"].clip(-1, 1))
+
+    df["acc_mag_jerk"] = df.groupby("sequence_id")["acc_mag"].diff().fillna(0)
+    df["rot_angle_vel"] = df.groupby("sequence_id")["rot_angle"].diff().fillna(0)
+
+    # ---------------- Angular vel / dist ----------------
+    rot_data = df[["rot_x", "rot_y", "rot_z", "rot_w"]]
+    ang_v = calculate_angular_velocity_from_quat(rot_data)           # (N,3)
+    df["angular_vel_x"] = ang_v[:, 0]
+    df["angular_vel_y"] = ang_v[:, 1]
+    df["angular_vel_z"] = ang_v[:, 2]
+    df["angular_dist"]  = calculate_angular_distance(rot_data)       # (N,)
+
+    # ---------------- Gravity removal (linacc) ----------------
+    acc_cols = ["acc_x", "acc_y", "acc_z"]
+    rot_cols = ["rot_x", "rot_y", "rot_z", "rot_w"]
+
+    linacc_all = np.zeros((len(df), 3), dtype=np.float32)
+    for _, seq in df.groupby("sequence_id", sort=False):
+        idx  = seq.index.values
+        acc  = seq[acc_cols].to_numpy(dtype=np.float32, copy=False)
+        quat = seq[rot_cols].to_numpy(dtype=np.float32, copy=False)
+        # クォータニオンは各シーケンス内で欠損補完（安定化）
+        quat = pd.DataFrame(quat).ffill().bfill().to_numpy(dtype=np.float32, copy=False)
+
+        lin = remove_gravity_from_acc(acc, quat).astype(np.float32)  # (T,3)
+        linacc_all[idx, :] = lin
+
+    df[["linacc_x", "linacc_y", "linacc_z"]] = linacc_all
+    df["linacc_mag"] = np.sqrt((linacc_all**2).sum(axis=1)).astype(np.float32)
+
+    # ---------------- First differences (edge cues) ----------------
+    for c in ["linacc_x", "linacc_y", "linacc_z", "linacc_mag", "acc_mag", "rot_angle"]:
+        df[f"{c}_d1"] = df.groupby("sequence_id")[c].diff().fillna(0).astype(np.float32)
+
+    # ---------------- Cast new cols to float32 (節約&一貫性) ----------------
+    to_f32 = [
+        "acc_mag","rot_angle","acc_mag_jerk","rot_angle_vel",
+        "angular_vel_x","angular_vel_y","angular_vel_z","angular_dist",
+        "linacc_x","linacc_y","linacc_z","linacc_mag"
+    ]
+    for c in to_f32:
+        df[c] = df[c].astype(np.float32)
+
     return df
 
-# =========================================================
-# Dataset（IMU のみ）
-# =========================================================
+
 class FixedLenIMUDataset(Dataset):
     def __init__(self, X_imu_list: List[np.ndarray], y: np.ndarray):
         self.Xi = X_imu_list
@@ -840,9 +896,9 @@ class GestureDataModule(L.LightningDataModule):
 
         # ---- split ----
         idx_all = np.arange(len(X_imu_list))
-        kf = GroupKFold(n_splits=self.n_splits, shuffle=True,
+        sgkf = StratifiedGroupKFold(n_splits=self.n_splits, shuffle=True,
                         random_state=self.cfg.data.random_seed)
-        tr_idx, val_idx = list(kf.split(idx_all, y_int, groups=subjects))[self.fold_idx]
+        tr_idx, val_idx = list(sgkf.split(idx_all, y_int, groups=subjects))[self.fold_idx]
         classes_arr = np.array(classes).tolist()
 
         def pack(indices):
