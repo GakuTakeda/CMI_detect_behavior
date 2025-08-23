@@ -520,13 +520,17 @@ class ModelVariant_LSTMGRU(nn.Module):
         self.attn = AttentionLayer(concat_dim)
 
         head_in = concat_dim + self.meta_hidden
-        self.head = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(head_in, self.head_hidden),
             nn.BatchNorm1d(self.head_hidden),
             nn.ReLU(),
             nn.Dropout(self.head_dropout),
-            nn.Linear(self.head_hidden, self.num_classes),
         )
+        self.head18 = nn.Linear(self.head_hidden, self.num_classes)
+        self.head9  = nn.Linear(self.head_hidden, 9)
+        self.head2  = nn.Linear(self.head_hidden, 2)
+
+        # --- forward ---
 
     def forward(self, x_imu):
         """x_imu: (B, T, imu_dim)"""
@@ -555,8 +559,11 @@ class ModelVariant_LSTMGRU(nn.Module):
 
         x = torch.cat([gru, lstm, noise], dim=2)         # (B,T,concat_dim)
         x = self.attn(x)                                 # (B,concat_dim)
-        x = torch.cat([x, meta], dim=1)                  # (B,concat_dim+meta_hidden)
-        return self.head(x)                              # (B,num_classes)
+        x = self.trunk(torch.cat([x, meta], dim=1))
+        logits18 = self.head18(x)
+        logits9  = self.head9(x)
+        logits2  = self.head2(x)
+        return {"logits18": logits18, "logits9": logits9, "logits2": logits2}
 
 
 class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
@@ -592,123 +599,231 @@ class litmodel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["cfg", "class_weight"])
-        self.model = ModelVariant_LSTMGRU(cfg)
+        self.model = ModelVariant_LSTMGRU(cfg)  # ← 3ヘッドを返す前提
+
+        # 主要メトリクスは18クラスで管理（従来互換）
         self.train_acc = MulticlassAccuracy(num_classes=cfg.num_classes, average="macro")
         self.val_acc   = MulticlassAccuracy(num_classes=cfg.num_classes, average="macro")
+
         if class_weight is not None:
             cw = torch.as_tensor(class_weight, dtype=torch.float32)
-            self.register_buffer("class_weight", cw)
+            self.register_buffer("class_weight", cw)  # 18クラスの重み
         else:
             self.class_weight = None
+
+        # 補助損失の重み（設定が無ければデフォルト）
+        self.aux9_w = float(cfg.head.aux9_w)
+        self.aux2_w = float(cfg.head.aux2_w)
+
         self.cfg = cfg
 
-    def forward(self, x_imu: torch.Tensor) -> torch.Tensor:
+    # ------------------------ utils ------------------------
+    def forward(self, x_imu: torch.Tensor) -> dict[str, torch.Tensor]:
+        # {"logits18": (B,18), "logits9": (B,9), "logits2": (B,2)}
         return self.model(x_imu)
 
-    # CE（hard/soft両対応）
     def _ce(self, logits: torch.Tensor, target: torch.Tensor, use_weight: bool = True) -> torch.Tensor:
-        if target.ndim == 2 and target.dtype != torch.long:  # soft-label
+        # hard/soft 両対応（soft: one-hot/prob）
+        if target.ndim == 2 and target.dtype != torch.long:
             logp = F.log_softmax(logits, dim=1)
             return -(target * logp).sum(dim=1).mean()
         hard = target if target.ndim == 1 else target.argmax(dim=1)
-        if use_weight and self.class_weight is not None:
+        if use_weight and self.class_weight is not None and logits.size(1) == self.class_weight.numel():
             ce = nn.CrossEntropyLoss(weight=self.class_weight)
         else:
             ce = nn.CrossEntropyLoss()
         return ce(logits, hard)
 
-    def _ce_per_sample(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _ce_per_sample(self, logits: torch.Tensor, target: torch.Tensor, use_weight: bool = True) -> torch.Tensor:
         if target.ndim == 2 and target.dtype != torch.long:
             logp = F.log_softmax(logits, dim=1)
             return -(target * logp).sum(dim=1)
         hard = target if target.ndim == 1 else target.argmax(dim=1)
-        if self.class_weight is not None:
+        if use_weight and self.class_weight is not None and logits.size(1) == self.class_weight.numel():
             ce = nn.CrossEntropyLoss(weight=self.class_weight, reduction='none')
         else:
             ce = nn.CrossEntropyLoss(reduction='none')
         return ce(logits, hard)
 
-    def _acc(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        hard = target if target.ndim == 1 else target.argmax(dim=1)
-        return self.train_acc(preds, hard) if self.training else self.val_acc(preds, hard)
+    # 18→2, 18→9 への階層マッピング（テンソル版）
+    @staticmethod
+    def _to_bin(y: torch.Tensor) -> torch.Tensor:
+        if y.ndim == 2 and y.dtype != torch.long:
+            y = y.argmax(dim=1)
+        return (y >= 9).long()  # 0..8→0, 9..17→1
 
+    @staticmethod
+    def _to_9(y: torch.Tensor) -> torch.Tensor:
+        if y.ndim == 2 and y.dtype != torch.long:
+            y = y.argmax(dim=1)
+        return (y % 9).long()
+
+    def _acc18(self, preds18: torch.Tensor, target18: torch.Tensor) -> torch.Tensor:
+        hard = target18 if target18.ndim == 1 else target18.argmax(dim=1)
+        return self.train_acc(preds18, hard) if self.training else self.val_acc(preds18, hard)
+
+    # ------------------------ training ------------------------
     def training_step(self, batch, batch_idx):
         # mixup: (x_imu, y_a, y_b, lam) / 普通: (x_imu, y)
         if len(batch) == 4:
             x_imu, y_a, y_b, lam = batch
-            logits = self.forward(x_imu)
-            la = self._ce_per_sample(logits, y_a)
-            lb = self._ce_per_sample(logits, y_b)
-            loss = self.hparams.cls_loss_weight * (lam * la + (1.0 - lam) * lb).mean()
-            preds = logits.argmax(dim=1)
-            acc   = self._acc(preds, y_a)
+            outs = self.forward(x_imu)
+            log18, log9, log2 = outs["logits18"], outs["logits9"], outs["logits2"]
+
+            # 18
+            la18 = self._ce_per_sample(log18, y_a, use_weight=True)
+            lb18 = self._ce_per_sample(log18, y_b, use_weight=True)
+            loss18 = (lam * la18 + (1.0 - lam) * lb18).mean()
+
+            # 9
+            ya9, yb9 = self._to_9(y_a), self._to_9(y_b)
+            la9 = self._ce_per_sample(log9, ya9, use_weight=False)
+            lb9 = self._ce_per_sample(log9, yb9, use_weight=False)
+            loss9 = (lam * la9 + (1.0 - lam) * lb9).mean()
+
+            # 2
+            ya2, yb2 = self._to_bin(y_a), self._to_bin(y_b)
+            la2 = self._ce_per_sample(log2, ya2, use_weight=False)
+            lb2 = self._ce_per_sample(log2, yb2, use_weight=False)
+            loss2 = (lam * la2 + (1.0 - lam) * lb2).mean()
+
+            loss = self.hparams.cls_loss_weight * (loss18 + self.aux9_w * loss9 + self.aux2_w * loss2)
+            preds18 = log18.argmax(dim=1)
+            acc18   = self._acc18(preds18, y_a)
+
+            self.log_dict(
+                {"train/loss": loss, "train/loss18": loss18, "train/loss9": loss9, "train/loss2": loss2, "train/acc": acc18},
+                on_step=True, on_epoch=True, batch_size=x_imu.size(0)
+            )
+
         else:
             x_imu, y = batch
-            logits = self.forward(x_imu)
-            loss   = self.hparams.cls_loss_weight * self._ce(logits, y)
-            preds  = logits.argmax(dim=1)
-            acc    = self._acc(preds, y)
+            outs = self.forward(x_imu)
+            log18, log9, log2 = outs["logits18"], outs["logits9"], outs["logits2"]
+
+            loss18 = self._ce(log18, y, use_weight=True)
+            loss9  = self._ce(log9,  self._to_9(y),  use_weight=False)
+            loss2  = self._ce(log2,  self._to_bin(y),use_weight=False)
+            loss   = self.hparams.cls_loss_weight * (loss18 + self.aux9_w * loss9 + self.aux2_w * loss2)
+
+            preds18 = log18.argmax(dim=1)
+            acc18   = self._acc18(preds18, y)
+
+            self.log_dict(
+                {"train/loss": loss, "train/loss18": loss18, "train/loss9": loss9, "train/loss2": loss2, "train/acc": acc18},
+                on_step=True, on_epoch=True, batch_size=x_imu.size(0)
+            )
+
         # lr ログ（optimizer が未設定のタイミング対策）
         try:
             lr_val = self.optimizers().param_groups[0]["lr"]
         except Exception:
             lr_val = float(self.hparams.lr_init)
-        self.log_dict({"train/loss": loss, "train/acc": acc, "lr": lr_val},
-                      on_step=True, on_epoch=True, batch_size=x_imu.size(0))
+        self.log("lr", lr_val, on_step=True, on_epoch=False)
+
         return loss
 
-    def to_binary(self, y): return [0 if i<9 else 1 for i in y]
-    def to_9class(self, y): return [i%9 for i in y]
-
+    # ------------------------ validation ------------------------
     def on_validation_epoch_start(self):
-        self._val_preds = []
-        self._val_trues = []
+        self._val_preds18 = []
+        self._val_trues18 = []
+        # 参考用（直接ヘッドの性能も見たい場合）
+        self._val_preds9  = []
+        self._val_trues9  = []
+        self._val_preds2  = []
+        self._val_trues2  = []
 
     def validation_step(self, batch, batch_idx):
         x_imu, y = batch
-        if y.ndim == 2: y = y.argmax(dim=1)
-        logits = self.forward(x_imu)
-        loss = self.hparams.cls_loss_weight * self._ce(logits, y)
-        preds = logits.argmax(dim=1)
-        self._val_preds.append(preds.cpu())
-        self._val_trues.append(y.cpu())
-        self.log("val/loss", loss, on_epoch=True, prog_bar=True, batch_size=x_imu.size(0))
+        if y.ndim == 2:  # soft label の場合は hard へ
+            y = y.argmax(dim=1)
+
+        outs = self.forward(x_imu)
+        log18, log9, log2 = outs["logits18"], outs["logits9"], outs["logits2"]
+
+        loss18 = self._ce(log18, y, use_weight=True)
+        loss9  = self._ce(log9,  self._to_9(y),  use_weight=False)
+        loss2  = self._ce(log2,  self._to_bin(y),use_weight=False)
+        loss   = self.hparams.cls_loss_weight * (loss18 + self.aux9_w * loss9 + self.aux2_w * loss2)
+
+        preds18 = log18.argmax(dim=1)
+        preds9  = log9.argmax(dim=1)
+        preds2  = log2.argmax(dim=1)
+
+        self._val_preds18.append(preds18.cpu()); self._val_trues18.append(y.cpu())
+        self._val_preds9.append(preds9.cpu());   self._val_trues9.append(self._to_9(y).cpu())
+        self._val_preds2.append(preds2.cpu());   self._val_trues2.append(self._to_bin(y).cpu())
+
+        self.log_dict(
+            {"val/loss": loss, "val/loss18": loss18, "val/loss9": loss9, "val/loss2": loss2},
+            on_epoch=True, prog_bar=False, batch_size=x_imu.size(0)
+        )
         return loss
 
     def on_validation_epoch_end(self):
-        preds = torch.cat(self._val_preds)
-        trues = torch.cat(self._val_trues)
+        preds = torch.cat(self._val_preds18)
+        trues = torch.cat(self._val_trues18)
+
+        # 主要指標（従来互換：18予測を 2/9 に落として算出）
         acc18 = accuracy_score(trues, preds)
         f118  = f1_score(trues, preds, average="macro")
-        tb_p, tb_t = torch.tensor(self.to_binary(preds)), torch.tensor(self.to_binary(trues))
-        acc2 = accuracy_score(tb_t, tb_p); f12 = f1_score(tb_t, tb_p, average="macro")
-        t9_p, t9_t = torch.tensor(self.to_9class(preds)), torch.tensor(self.to_9class(trues))
-        acc9 = accuracy_score(t9_t, t9_p); f19 = f1_score(t9_t, t9_p, average="macro")
+
+        tb_p, tb_t = (preds >= 9).long(), (trues >= 9).long()
+        acc2 = accuracy_score(tb_t, tb_p)
+        f12  = f1_score(tb_t, tb_p, average="macro")
+
+        t9_p, t9_t = (preds % 9).long(), (trues % 9).long()
+        acc9 = accuracy_score(t9_t, t9_p)
+        f19  = f1_score(t9_t, t9_p, average="macro")
+
         f1_avg = (f12 + f19) / 2.0
-        self.log_dict({
+
+        log_dict = {
             "val/acc18": acc18, "val/f1_18": f118,
             "val/acc_bin": acc2, "val/f1_bin": f12,
-            "val/acc_9": acc9,   "val/f1_9": f19,
+            "val/acc_9": acc9,   "val/f1_9":  f19,
             "val/f1_avg": f1_avg,
-            "val/neg_f1_18": 1.0 - f118,
-        }, prog_bar=True)
+            "val/neg_f1_18": 1.0 - f118,  # scheduler用
+        }
 
+        # 参考：直接ヘッドの2値/9値性能（デバッグ可視化に便利）
+        try:
+            p9 = torch.cat(self._val_preds9).numpy(); t9 = torch.cat(self._val_trues9).numpy()
+            p2 = torch.cat(self._val_preds2).numpy(); t2 = torch.cat(self._val_trues2).numpy()
+            log_dict.update({
+                "val/f1_9_head":  f1_score(t9, p9, average="macro"),
+                "val/f1_bin_head":f1_score(t2, p2, average="macro"),
+            })
+        except Exception:
+            pass
+
+        self.log_dict(log_dict, prog_bar=True)
+
+    # ------------------------ test ------------------------
     def test_step(self, batch, batch_idx):
         x_imu, y = batch
-        logits = self.forward(x_imu)
-        loss   = self.hparams.cls_loss_weight * self._ce(logits, y, use_weight=False)
-        self.log_dict({"test/loss": loss}, on_step=False, on_epoch=True, batch_size=x_imu.size(0))
+        if y.ndim == 2: y = y.argmax(dim=1)
+        outs = self.forward(x_imu)
+        log18, log9, log2 = outs["logits18"], outs["logits9"], outs["logits2"]
+        loss18 = self._ce(log18, y, use_weight=True)
+        loss9  = self._ce(log9,  self._to_9(y),  use_weight=False)
+        loss2  = self._ce(log2,  self._to_bin(y),use_weight=False)
+        loss   = self.hparams.cls_loss_weight * (loss18 + self.aux9_w * loss9 + self.aux2_w * loss2)
+        self.log_dict({"test/loss": loss, "test/loss18": loss18, "test/loss9": loss9, "test/loss2": loss2},
+                      on_step=False, on_epoch=True, batch_size=x_imu.size(0))
 
+    # ------------------------ optim ------------------------
     def configure_optimizers(self):
         decay, no_decay = [], []
         for n, p in self.named_parameters():
-            if not p.requires_grad: continue
-            if p.ndim == 1 or n.endswith(".bias"): no_decay.append(p)
-            else: decay.append(p)
+            if not p.requires_grad:
+                continue
+            (no_decay if (p.ndim == 1 or n.endswith(".bias")) else decay).append(p)
+
         wd = float(self.hparams.weight_decay)
         lr = float(self.hparams.lr_init)
-        adamw_params = [{"params": decay, "weight_decay": wd},{"params": no_decay, "weight_decay": 0.0}]
-        adam_params  = [{"params": decay, "weight_decay": wd},{"params": no_decay, "weight_decay": 0.0}]
+        adamw_params = [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}]
+        adam_params  = [{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}]
 
         if self.cfg.scheduler.name in ("warmup_cosine", "cosine", "cos"):
             opt = torch.optim.AdamW(adamw_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
@@ -719,17 +834,28 @@ class litmodel(L.LightningModule):
                 base_lr=self.hparams.lr_init,
                 final_lr=self.hparams.min_lr,
             )
-            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch", "frequency": 1, "name": "warmup_cosine"}}
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": sched, "interval": "epoch", "frequency": 1, "name": "warmup_cosine"}}
+
         elif self.cfg.scheduler.name in ("plateau", "reduce_on_plateau", "rop", "reduceplateau"):
             opt = torch.optim.Adam(adam_params, lr=lr, betas=(0.9, 0.999), eps=1e-8)
             sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, mode="min", factor=self.cfg.scheduler.factor, patience=self.cfg.scheduler.patience,
-                threshold=self.cfg.scheduler.threshold, threshold_mode=self.cfg.scheduler.threshold_mode,
-                cooldown=self.cfg.scheduler.cooldown, min_lr=self.cfg.scheduler.min_lr_sched, eps=1e-8,
+                opt, mode="min",
+                factor=self.cfg.scheduler.factor,
+                patience=self.cfg.scheduler.patience,
+                threshold=self.cfg.scheduler.threshold,
+                threshold_mode=self.cfg.scheduler.threshold_mode,
+                cooldown=self.cfg.scheduler.cooldown,
+                min_lr=self.cfg.scheduler.min_lr_sched,
+                eps=1e-8,
             )
-            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "monitor": "val/neg_f1_18", "interval": "epoch", "frequency": 1, "reduce_on_plateau": True, "name": "plateau"}}
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": sched, "monitor": "val/neg_f1_18",
+                                     "interval": "epoch", "frequency": 1,
+                                     "reduce_on_plateau": True, "name": "plateau"}}
         else:
             raise ValueError(f"Unknown scheduler name: {self.cfg.scheduler.name}")
+
 
 def _select_imu_cols(all_cols: list[str]) -> list[str]:
     meta = {'gesture','gesture_int','sequence_type','behavior','orientation',

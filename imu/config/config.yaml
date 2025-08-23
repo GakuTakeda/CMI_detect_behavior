@@ -66,6 +66,8 @@ noise_std: 0.09
 head:
   hidden: 512
   dropout: 0.5
+  aux9_w: 0.3
+  aux2_w: 0.3
 
 # aug:
 #   no_aug: true
