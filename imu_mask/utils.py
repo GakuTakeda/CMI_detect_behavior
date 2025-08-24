@@ -290,32 +290,16 @@ def calculate_angular_distance(rot_data):
 
 
 def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
-    # df = remove_gravity_from_acc_in_train(df)
     df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
     df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1, 1))
     df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
     df['rot_angle_vel'] = df.groupby('sequence_id')['rot_angle'].diff().fillna(0)
-    # df['linear_acc_mag'] = np.sqrt(df['linear_acc_x']**2 + df['linear_acc_y']**2 + df['linear_acc_z']**2)
-    # df['linear_acc_mag_jerk'] = df.groupby('sequence_id')['linear_acc_mag'].diff().fillna(0)
     rot_data = df[['rot_x', 'rot_y', 'rot_z', 'rot_w']]
     angular_vel_group = calculate_angular_velocity_from_quat(rot_data)
     df['angular_vel_x'] = angular_vel_group[:, 0]
     df['angular_vel_y'] = angular_vel_group[:, 1]
     df['angular_vel_z'] = angular_vel_group[:, 2]
     df['angular_dist'] = calculate_angular_distance(rot_data)
-
-    # tof_pixel_cols = [f"tof_{i}_v{p}" for i in range(1, 6) for p in range(64)]
-    # tof_data_np = df[tof_pixel_cols].replace(-1, np.nan).to_numpy()
-    # reshaped_tof = tof_data_np.reshape(len(df), 5, 64)
-    # with warnings.catch_warnings():
-    #     warnings.filterwarnings('ignore', r'Mean of empty slice'); warnings.filterwarnings('ignore', r'Degrees of freedom <= 0 for slice')
-    #     mean_vals, std_vals = np.nanmean(reshaped_tof, axis=2), np.nanstd(reshaped_tof, axis=2)
-    #     min_vals, max_vals = np.nanmin(reshaped_tof, axis=2), np.nanmax(reshaped_tof, axis=2)
-    # tof_agg_cols = []
-    # for i in range(1, 6):
-    #     df[f'tof_{i}_mean'], df[f'tof_{i}_std'] = mean_vals[:, i-1], std_vals[:, i-1]
-    #     df[f'tof_{i}_min'], df[f'tof_{i}_max'] = min_vals[:, i-1], max_vals[:, i-1]
-    #     tof_agg_cols.extend([f'tof_{i}_mean', f'tof_{i}_std', f'tof_{i}_min', f'tof_{i}_max'])
     insert_cols = ['acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z', 'angular_dist']
     cols = list(df.columns)
 
@@ -330,27 +314,6 @@ def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
     df = df[new_order]
 
     return df
-
-
-class SequenceDatasetVarLen(Dataset):
-    def __init__(self, X_list, y_array, augmenter=None):
-        """
-        X_list: list[np.ndarray or torch.Tensor]、各要素は [Ti, C]（IMUのみ）
-        y_array: np.ndarray[int]  クラスID（one-hot不要）
-        augmenter: callable(x)->x  ※時系列オーグメント（任意）
-        """
-        self.X = [torch.as_tensor(x, dtype=torch.float32) for x in X_list]
-        self.y = torch.as_tensor(y_array, dtype=torch.long)
-        self.aug = augmenter
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, i):
-        x = self.X[i]
-        if self.aug is not None:
-            x = self.aug(x)  # ここで [Ti,C] のまま拡張
-        return x, self.y[i]
 
 def preprocess_sequence(
         df_seq: pd.DataFrame,
@@ -370,6 +333,30 @@ def preprocess_sequence(
     mat = scaler.transform(mat).astype("float32")
     return torch.from_numpy(mat)      
 
+class SequenceDatasetVarLen(Dataset):
+    def __init__(self, X_list, y_array, augmenter=None):
+        self.use_aug = callable(augmenter)
+        self.aug = augmenter
+
+        self.X = []
+        for x in X_list:
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu().numpy()
+            x = np.asarray(x, dtype=np.float32)
+            self.X.append(x)
+
+        self.y = torch.as_tensor(y_array, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, i):
+        x = self.X[i]
+        if self.use_aug:
+            # numpyでaugmentしてからtorch化
+            x = self.aug(x.copy()).astype(np.float32)
+        x = torch.from_numpy(x)  # [T,C] torch.Tensor に戻す
+        return x, self.y[i]
 
 
 def collate_pad(batch):
@@ -421,119 +408,115 @@ def mixup_pad_collate_fn(alpha: float = 0.2, return_soft: bool = False):
 
     return _collate
 
-def pad_truncate(seq: np.ndarray, pad_len: int) -> torch.Tensor:
 
-    # (T, C) → torch.Tensor
-    t = torch.as_tensor(seq, dtype=torch.float32)
+def _randu(a=0.0, b=1.0): return np.random.uniform(a, b)
 
-    T, C = t.shape
-    if T >= pad_len:                     # --- truncating = 'post' ---
-        t = t[:pad_len]                  # 後ろを切り捨て
-    else:                                # --- padding = 'post' ---
-        pad_size = (pad_len - T, C)      # 足りない分だけ 0 行を作る
-        t = torch.cat([t, t.new_zeros(pad_size)], dim=0)
-
-    return t.unsqueeze(0)  
-
-class Augment:
+class AugmentIMUOnly:
     """
-    時系列 IMU ＋ TOF 入力のデータ拡張 (PyTorch 版)
-
-    Parameters
-    ----------
-    p_jitter : float
-        ジッタ＋スケーリングを適用する確率
-    sigma : float
-        ジッタの標準偏差
-    scale_range : (float, float)
-        スケール拡張の下限・上限
-    p_dropout : float
-        センサ Drop-out を適用する確率
-    p_moda : float
-        Motion Drift (MODA) を適用する確率
-    drift_std : float
-        Drift の 1 ステップあたり標準偏差
-    drift_max : float
-        Drift の上限値 (絶対値でクリップ)
+    入出力:
+      imu: [L, C_imu]  (float32)
+    返り値も同形状（maskなし・固定長のまま）
     """
-
-    def __init__(
-        self,
-        imu_dim: int,
-        p_jitter: float = 0.8,
-        sigma: float = 0.02,
-        scale_range: Sequence[float] = (0.9, 1.1),
-        p_dropout: float = 0.3,
-        p_moda: float = 0.5,
-        drift_std: float = 0.005,
-        drift_max: float = 0.25,
-    ) -> None:
-
-        self.imu_dim = imu_dim
-        self.p_jitter  = p_jitter
-        self.sigma     = sigma
-        self.scale_min, self.scale_max = scale_range
-        self.p_dropout = p_dropout
-        self.p_moda    = p_moda
+    def __init__(self,
+        p_time_shift=0.7, max_shift_ratio=0.1,
+        p_time_warp=0.5,  warp_min=0.9, warp_max=1.1,
+        p_block_dropout=0.5, n_blocks=(1,3), block_len=(2,6),
+        p_imu_jitter=0.9, imu_sigma=0.03,
+        p_imu_scale=0.5,  imu_scale_sigma=0.03,
+        p_imu_drift=0.5,  drift_std=0.003, drift_clip=0.3,
+        p_imu_small_rot=0.0, rot_deg=5.0,
+        pad_value=0.0,
+    ):
+        self.p_time_shift = p_time_shift
+        self.max_shift_ratio = max_shift_ratio
+        self.p_time_warp = p_time_warp
+        self.warp_min, self.warp_max = warp_min, warp_max
+        self.p_block_dropout = p_block_dropout
+        self.n_blocks, self.block_len = n_blocks, block_len
+        self.p_imu_jitter = p_imu_jitter
+        self.imu_sigma = imu_sigma
+        self.p_imu_scale = p_imu_scale
+        self.imu_scale_sigma = imu_scale_sigma
+        self.p_imu_drift = p_imu_drift
         self.drift_std = drift_std
-        self.drift_max = drift_max
+        self.drift_clip = drift_clip
+        self.p_imu_small_rot = p_imu_small_rot
+        self.rot_deg = rot_deg
+        self.pad_value = pad_value
 
-    # ---------- Jitter & Scaling ----------
-    def jitter_scale(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (T, F)  時系列長 T、特徴次元 F
-        """
-        noise  = torch.randn_like(x) * self.sigma
-        scale  = torch.empty(
-            (1, x.shape[1]),
-            device=x.device,
-            dtype=x.dtype
-        ).uniform_(self.scale_min, self.scale_max)
-        return (x + noise) * scale
+    # ---------- time ops ----------
+    def _time_shift(self, x, shift):
+        L = x.shape[0]
+        if shift == 0: return x
+        out = np.full_like(x, self.pad_value)
+        if shift > 0:
+            out[shift:] = x[:L-shift]
+        else:
+            out[:L+shift] = x[-shift:]
+        return out
 
-    # ---------- Sensor Drop-out ----------
-    def sensor_dropout(self, x: torch.Tensor) -> torch.Tensor:
-        if torch.rand(1, device=x.device) < self.p_dropout:
-            x = x.clone()              # 勾配履歴を保持
-            x[:, self.imu_dim:] = 0.0
+    def _time_warp(self, x: np.ndarray, scale: float) -> np.ndarray:
+        L = x.shape[0]
+        Lp = max(2, int(round(L * scale)))
+        t = torch.from_numpy(x.astype(np.float32)).transpose(0,1).unsqueeze(0)  # [1,C,L]
+        y = F.interpolate(t, size=Lp, mode="linear", align_corners=False)
+        y = F.interpolate(y, size=L,  mode="linear", align_corners=False)
+        return y.squeeze(0).transpose(0,1).contiguous().numpy()
+
+    def _block_dropout(self, x):
+        L = x.shape[0]
+        nb = np.random.randint(self.n_blocks[0], self.n_blocks[1]+1)
+        for _ in range(nb):
+            bl = np.random.randint(self.block_len[0], self.block_len[1]+1)
+            s = np.random.randint(0, max(1, L - bl + 1))
+            x[s:s+bl] = self.pad_value
         return x
 
-    # ---------- Motion Drift (MODA) ----------
-    def motion_drift(self, x: torch.Tensor) -> torch.Tensor:
-        T = x.shape[0]
+    # ---------- imu ops ----------
+    def _imu_jitter(self, imu):        # add noise
+        return imu + np.random.randn(*imu.shape).astype(np.float32) * self.imu_sigma
 
-        drift = torch.randn(
-            (T, 1), device=x.device, dtype=x.dtype
-        ) * self.drift_std             # 正規乱数
-        drift = torch.cumsum(drift, dim=0)
-        drift = drift.clamp(-self.drift_max, self.drift_max)
+    def _imu_scale(self, imu):         # per-channel scale
+        scale = (1.0 + np.random.randn(imu.shape[1]).astype(np.float32) * self.imu_scale_sigma)
+        return imu * scale[None, :]
 
-        x = x.clone()
-        x[:, :6] += drift              # 3軸加速度＋3軸角速度
-        if self.imu_dim > 6:
-            x[:, 6:self.imu_dim] += drift   # 磁気・気圧などがある場合
-        return x
+    def _imu_drift(self, imu):
+        L, C = imu.shape
+        drift = np.cumsum(np.random.randn(L, C).astype(np.float32) * self.drift_std, axis=0)
+        np.clip(drift, -self.drift_clip, self.drift_clip, out=drift)
+        return imu + drift
 
-    # ---------- master call ----------
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor
-            入力系列 (T, F).  勾配不要ならあらかじめ `with torch.no_grad()` 推奨
-        imu_dim : int
-            x の IMU 部分の次元数 (TOF など他センサとの境界)
-        """
-        if torch.rand(1, device=x.device) < self.p_jitter:
-            x = self.jitter_scale(x)
+    def _imu_small_rot(self, imu):
+        th = np.deg2rad(self.rot_deg) * np.random.uniform(-1,1)
+        Rz = np.array([[ np.cos(th), -np.sin(th), 0],
+                       [ np.sin(th),  np.cos(th), 0],
+                       [ 0,           0,          1]], dtype=np.float32)
+        def rot3(block):
+            return (block @ Rz.T).astype(np.float32)
+        imu_out = imu.copy()
+        if imu.shape[1] >= 3:
+            imu_out[:, :3] = rot3(imu[:, :3])
+        if imu.shape[1] >= 6:
+            imu_out[:, 3:6] = rot3(imu[:, 3:6])
+        return imu_out
 
-        if torch.rand(1, device=x.device) < self.p_moda:
-            x = self.motion_drift(x)
-
-        x = self.sensor_dropout(x)
-        return x
-
-    
+    # ---------- main ----------
+    def __call__(self, imu: np.ndarray):
+        L = imu.shape[0]
+        if np.random.rand() < self.p_time_shift:
+            shift = int(np.round(_randu(-self.max_shift_ratio, self.max_shift_ratio) * L))
+            imu = self._time_shift(imu, shift)
+        if np.random.rand() < self.p_time_warp:
+            s = _randu(self.warp_min, self.warp_max)
+            imu = self._time_warp(imu, s)
+        if np.random.rand() < self.p_block_dropout:
+            imu = self._block_dropout(imu)
+        if np.random.rand() < self.p_imu_jitter: imu = self._imu_jitter(imu)
+        if np.random.rand() < self.p_imu_scale:  imu = self._imu_scale(imu)
+        if np.random.rand() < self.p_imu_drift:  imu = self._imu_drift(imu)
+        if self.p_imu_small_rot > 0 and np.random.rand() < self.p_imu_small_rot:
+            imu = self._imu_small_rot(imu)
+        return imu.astype(np.float32)
 
 class GaussianNoise(nn.Module):
     def __init__(self, stddev=0.1):

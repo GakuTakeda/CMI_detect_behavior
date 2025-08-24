@@ -1,6 +1,6 @@
 # cv_main.py
 import hydra, lightning as L
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from datamodule import GestureDataModule
 from utils import litmodel
 import json
@@ -9,13 +9,14 @@ import torch
 import numpy as np
 from utils import seed_everything, calc_f1
 
-@hydra.main(config_path="config", config_name="config", version_base="1.3")
+@hydra.main(config_path="config", config_name="imu_mask", version_base="1.3")
 def run(cfg: DictConfig):
 
     caluculate = calc_f1()
 
     seed_everything(cfg.data.random_seed)
     n_splits = cfg.data.n_splits        # 例: 5
+    avg = []
     for fold in range(n_splits):
         print(f"\n===== Fold {fold} / {n_splits-1} =====")
 
@@ -99,10 +100,16 @@ def run(cfg: DictConfig):
                 f"binary_score_of_fold_{fold+1}_imu":  caluculate.binary_score(solution, submission),
                 f"macro_score_of_fold_{fold+1}_imu":   caluculate.macro_score(solution, submission),
             }
+            avg.append(scores[f"binary_score_of_fold_{fold+1}_imu_mask"] + scores[f"macro_score_of_fold_{fold+1}_imu_mask"])
 
             with open(dm.export_dir / f"scores_{fold+1}.json", "w") as f:
                 json.dump(scores, f, indent=2, ensure_ascii=False)
 
+    with open(os.path.join(dm.export_dir, "config_resolved.yaml"), "w", encoding="utf-8") as f:
+        f.write(OmegaConf.to_yaml(cfg))
+    print("Average scores across folds:", np.mean(avg))
+    with open(dm.export_dir / "avg_scores.json", "w", encoding="utf-8") as f:
+        json.dump({"average_score": np.mean(avg)}, f, indent=2, ensure_ascii=False)
 
 if __name__ == "__main__":
     run()
