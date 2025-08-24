@@ -841,9 +841,9 @@ class GestureDataModule(L.LightningDataModule):
 
         # ---- split ----
         idx_all = np.arange(len(X_imu_list))
-        sgkf = StratifiedGroupKFold(n_splits=self.n_splits, shuffle=True,
+        skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True,
                         random_state=self.cfg.data.random_seed)
-        tr_idx, val_idx = list(sgkf.split(idx_all, y_int, groups=subjects))[self.fold_idx]
+        tr_idx, val_idx = list(skf.split(idx_all, y_int))[self.fold_idx]
         classes_arr = np.array(classes).tolist()
 
         def pack(indices):

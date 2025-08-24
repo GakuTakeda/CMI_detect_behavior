@@ -14,7 +14,7 @@ data:
   truncate_mode_val: tail
 
 train:
-  batch_size: 64
+  batch_size: 128
   batch_size_val: 64
   mixup_alpha: 0.4           # Beta(0.4, 0.4)
   mixup_prob: 0.5            # IMUのみMixUpを p=0.5
@@ -67,51 +67,51 @@ head:
   hidden: 512
   dropout: 0.5
 
-# aug:
-#   no_aug: true
-
-#   # 時間方向
-#   p_time_shift: 0.0
-#   max_shift_ratio: 0.1
-#   p_time_warp: 0.5
-#   warp_min: 0.9
-#   warp_max: 1.1
-#   p_block_dropout: 0.5
-#   n_blocks: [1, 2]
-#   block_len: [2, 5]
-
-#   # IMU系
-#   p_imu_jitter: 0.9
-#   imu_sigma: 0.03
-#   p_imu_scale: 0.5
-#   imu_scale_sigma: 0.03
-#   p_imu_drift: 0.5
-#   drift_std: 0.003
-#   drift_clip: 0.25
-#   p_imu_small_rot: 0.0   # 使うなら 0.2 など
-#   rot_deg: 5.0
-
-#   pad_value: 0.0
-
-
-# ---- 拡張を完全OFFにしたい場合の例（IMU-only版） ----
 aug:
   no_aug: false
+
   p_time_shift: 0.5
-  max_shift_ratio: 0.2
-  p_time_warp: 0.0
-  warp_min: 1.0
-  warp_max: 1.0
-  p_block_dropout: 0.0
-  n_blocks: [0, 0]
-  block_len: [0, 0]
-  p_imu_jitter: 0.0
-  imu_sigma: 0.0
-  p_imu_scale: 0.0
-  imu_scale_sigma: 0.0
-  p_imu_drift: 0.0
-  drift_std: 0.0
-  drift_clip: 0.0
-  p_imu_small_rot: 0.0
-  rot_deg: 0.0
+  max_shift_ratio: 0.1
+  p_time_warp: 0.5
+  warp_min: 0.9
+  warp_max: 1.1
+  p_block_dropout: 0.5
+  n_blocks: [1, 2]
+  block_len: [2, 5]
+
+  # IMU系
+  p_imu_jitter: 0.5
+  imu_sigma: 0.03
+  p_imu_scale: 0.5
+  imu_scale_sigma: 0.03
+  p_imu_drift: 0.5
+  drift_std: 0.003
+  drift_clip: 0.25
+  p_imu_small_rot: 0.0   # 使うなら 0.2 など
+  rot_deg: 5.0
+
   pad_value: 0.0
+
+
+
+# # ---- 拡張を完全OFFにしたい場合の例（IMU-only版） ----
+# aug:
+#   no_aug: false
+#   p_time_shift: 0.5
+#   max_shift_ratio: 0.2
+#   p_time_warp: 0.0
+#   warp_min: 1.0
+#   warp_max: 1.0
+#   p_block_dropout: 0.0
+#   n_blocks: [0, 0]
+#   block_len: [0, 0]
+#   p_imu_jitter: 0.0
+#   imu_sigma: 0.0
+#   p_imu_scale: 0.0
+#   imu_scale_sigma: 0.0
+#   p_imu_drift: 0.0
+#   drift_std: 0.0
+#   drift_clip: 0.0
+#   p_imu_small_rot: 0.0
+#   rot_deg: 0.0
+#   pad_value: 0.0
