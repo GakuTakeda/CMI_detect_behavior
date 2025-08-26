@@ -10,7 +10,6 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm.notebook import tqdm
 from torch.amp import autocast
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from transformers import BertConfig, BertModel
@@ -27,7 +26,7 @@ from sklearn.metrics import f1_score
 from typing import Optional, Sequence, Dict, Any, Union, Tuple
 import numpy as np, joblib, pathlib
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 from hydra.core.hydra_config import HydraConfig
 import math
@@ -842,12 +841,12 @@ class GestureDataModule(L.LightningDataModule):
         y_int = np.array(y_int)
 
         # ---- StratifiedGroupKFold（subject でグループ）----
-        sgkf = StratifiedGroupKFold(
+        skf = StratifiedKFold(
             n_splits=self.n_splits, shuffle=True, random_state=self.cfg.seed
         )
 
         tr_idx, val_idx = list(
-            sgkf.split(np.arange(len(X_list)), y_int, np.array(subjects))
+            skf.split(np.arange(len(X_list)), y_int)
         )[self.fold_idx]
 
         # ---- Dataset（可変長）----
