@@ -2,7 +2,7 @@
 import hydra, lightning as L
 from omegaconf import DictConfig, OmegaConf
 from datamodule import GestureDataModule
-from utils import litmodel
+from utils import litmodel_mask
 import json
 import os
 import torch
@@ -25,7 +25,7 @@ def run(cfg: DictConfig):
             dm.prepare_data()
         dm.setup()
 
-        model = litmodel(
+        model = litmodel_mask(
             cfg,
             num_classes=18,
             lr_init=cfg.train.lr_init,
@@ -65,7 +65,7 @@ def run(cfg: DictConfig):
         with torch.no_grad():
             device = cfg.train.device
 
-            model = litmodel.load_from_checkpoint(
+            model = litmodel_mask.load_from_checkpoint(
                 checkpoint_path=os.path.join(ckpt_dir, f"best_of_fold_imu_{fold+1}.ckpt"),
                 cfg=cfg,
                 num_classes=18,
@@ -97,9 +97,11 @@ def run(cfg: DictConfig):
                 solution.extend([gesture_classes[i] for i in true_ids])
 
             scores = {
-                f"binary_score_of_fold_{fold+1}_imu":  caluculate.binary_score(solution, submission),
-                f"macro_score_of_fold_{fold+1}_imu":   caluculate.macro_score(solution, submission),
+                f"binary_score_of_fold_{fold+1}_imu_mask":  caluculate.binary_score(solution, submission),
+                f"macro_score_of_fold_{fold+1}_imu_mask":   caluculate.macro_score(solution, submission),
             }
+
+            print("Fold scores:", scores)
             avg.append(scores[f"binary_score_of_fold_{fold+1}_imu_mask"] + scores[f"macro_score_of_fold_{fold+1}_imu_mask"])
 
             with open(dm.export_dir / f"scores_{fold+1}.json", "w") as f:

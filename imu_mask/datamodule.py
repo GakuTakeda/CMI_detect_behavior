@@ -105,6 +105,8 @@ class GestureDataModule(L.LightningDataModule):
         y_tr = y_int[tr_idx]
         y_val = y_int[val_idx]
 
+        if self.cfg.aug.no_aug:
+            self.augmenter = None
         self.ds_tr_imu  = SequenceDatasetVarLen(X_tr, y_tr, augmenter=self.augmenter)
         self.ds_val_imu = SequenceDatasetVarLen(X_val, y_val, augmenter=None)
 

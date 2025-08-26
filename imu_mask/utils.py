@@ -518,7 +518,7 @@ class AugmentIMUOnly:
             imu = self._imu_small_rot(imu)
         return imu.astype(np.float32)
 
-class GaussianNoise(nn.Module):
+class GaussianNoise_mask(nn.Module):
     def __init__(self, stddev=0.1):
         super().__init__()
         self.stddev = stddev
@@ -537,7 +537,7 @@ def down_len(lengths: torch.Tensor, pool_sizes: Sequence[int]) -> torch.Tensor:
         l = torch.div(l, p, rounding_mode="floor")
     return l.clamp_min(1)
 
-class AttentionLayer(nn.Module):
+class AttentionLayer_mask(nn.Module):
     """マスク対応のシンプルなアテンションプーリング"""
     def __init__(self, in_dim: int, hidden: int = 128):
         super().__init__()
@@ -557,7 +557,7 @@ class AttentionLayer(nn.Module):
         return pooled
 
 
-class MultiScaleConv1d(nn.Module):
+class MultiScaleConv1d_mask(nn.Module):
     """Multi-scale temporal convolution block (長さ保存: stride=1, SAME padding相当)"""
     def __init__(self, in_channels, out_per_kernel, kernel_sizes=[3, 5, 7]):
         super().__init__()
@@ -581,7 +581,7 @@ class MultiScaleConv1d(nn.Module):
         return torch.cat(outputs, dim=1)            # [N, out_per_kernel*K, L]
 
 
-class EnhancedSEBlock(nn.Module):
+class EnhancedSEBlock_mask(nn.Module):
     """Avg/Maxの両方でSE"""
     def __init__(self, channels, reduction=8):
         super().__init__()
@@ -603,7 +603,7 @@ class EnhancedSEBlock(nn.Module):
         return x * y.expand_as(x)
 
 
-class EnhancedResidualSEBlock(nn.Module):
+class EnhancedResidualSEBlock_mask(nn.Module):
     """
     (Conv-BN-ReLU)×2 → SE → Add → ReLU → MaxPool → Dropout
     出力長: floor(L_in / pool_size)
@@ -619,7 +619,7 @@ class EnhancedResidualSEBlock(nn.Module):
         self.shortcut = nn.Conv1d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
         self.bn_sc = nn.BatchNorm1d(out_ch) if in_ch != out_ch else nn.Identity()
 
-        self.se     = EnhancedSEBlock(out_ch)
+        self.se     = EnhancedSEBlock_mask(out_ch)
         self.pool   = nn.MaxPool1d(pool_size)  # stride=pool_size
         self.drop   = nn.Dropout(drop)
         self.pool_size = pool_size
@@ -635,7 +635,7 @@ class EnhancedResidualSEBlock(nn.Module):
         return out                        # (N, C_out, floor(L/p))
 
 
-class MetaFeatureExtractor(nn.Module):
+class MetaFeatureExtractor_mask(nn.Module):
     """
     時系列マスク付きの簡易メタ特徴 (各Ch 5個: mean, std, min, max, abs-mean)
     入力: x[B,T,C], mask[B,T]
@@ -674,7 +674,7 @@ class MetaFeatureExtractor(nn.Module):
 # ---------------------------
 # Model (完全版)
 # ---------------------------
-class ModelVariant_LSTMGRU(nn.Module):
+class ModelVariant_LSTMGRU_mask(nn.Module):
     """
     Per-channel CNN → BiGRU & BiLSTM → Noise Skip → AttentionPooling → Head
     可変長対応（pack）＆マスク対応
@@ -686,7 +686,7 @@ class ModelVariant_LSTMGRU(nn.Module):
         num_classes = cfg.model.model.num_classes
 
         # ----- Meta -----
-        self.meta_extractor = MetaFeatureExtractor()
+        self.meta_extractor = MetaFeatureExtractor_mask()
         self.meta_dense = nn.Sequential(
             nn.Linear(5 * C, cfg.model.meta.proj_dim),
             nn.BatchNorm1d(cfg.model.meta.proj_dim),
@@ -702,9 +702,9 @@ class ModelVariant_LSTMGRU(nn.Module):
 
         # 構成: MSConv (長さ保存) → ResidualSE(pool) → ResidualSE(pool)
         branch = lambda: nn.Sequential(
-            MultiScaleConv1d(1, out_per_kernel, kernel_sizes=ks), # [N, ms_out, L]
-            EnhancedResidualSEBlock(ms_out, se_out, k=3, pool_size=cfg.model.cnn.pool_sizes[0], drop=cfg.model.cnn.se.drop),
-            EnhancedResidualSEBlock(se_out, se_out, k=3, pool_size=cfg.model.cnn.pool_sizes[1], drop=cfg.model.cnn.se.drop),
+            MultiScaleConv1d_mask(1, out_per_kernel, kernel_sizes=ks), # [N, ms_out, L]
+            EnhancedResidualSEBlock_mask(ms_out, se_out, k=3, pool_size=cfg.model.cnn.pool_sizes[0], drop=cfg.model.cnn.se.drop),
+            EnhancedResidualSEBlock_mask(se_out, se_out, k=3, pool_size=cfg.model.cnn.pool_sizes[1], drop=cfg.model.cnn.se.drop),
         )
         self.branches = nn.ModuleList([branch() for _ in range(C)])
 
@@ -730,14 +730,14 @@ class ModelVariant_LSTMGRU(nn.Module):
         )
 
         # ----- Noise skip -----
-        self.noise = GaussianNoise(cfg.model.noise.std)
+        self.noise = GaussianNoise_mask(cfg.model.noise.std)
 
         # ----- Attention Pooling -----
         gru_dim   = cfg.model.rnn.hidden_size * bi
         lstm_dim  = cfg.model.rnn.hidden_size * bi
         noise_dim = per_step_feat
         attn_in_dim = gru_dim + lstm_dim + noise_dim
-        self.attention_pooling = AttentionLayer(attn_in_dim)
+        self.attention_pooling = AttentionLayer_mask(attn_in_dim)
 
         # ----- Head -----
         head_hidden = cfg.model.head.hidden
@@ -802,9 +802,9 @@ class ModelVariant_LSTMGRU(nn.Module):
         return z_cls
 
 
-class litmodel(L.LightningModule):
+class litmodel_mask(L.LightningModule):
     """
-    LightningModule wrapping ModelVariant_LSTMGRU (variable-length + mask)
+    LightningModule wrapping ModelVariant_LSTMGRU_mask (variable-length + mask)
     入力:  x         … [B, T, C]
           lengths   … [B]
           mask      … [B, T] (True=有効)
@@ -822,7 +822,7 @@ class litmodel(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["cfg"])
-        self.model = ModelVariant_LSTMGRU(cfg)
+        self.model = ModelVariant_LSTMGRU_mask(cfg)
 
         # metrics
         self.train_acc = MulticlassAccuracy(num_classes=num_classes, average="macro")
@@ -962,7 +962,7 @@ class MacroImuModel(nn.Module):
         ch = self.num_channels
 
         # 1. Meta features --------------------------------------------------
-        self.meta_extractor = MetaFeatureExtractor()          # (B, 5*C)
+        self.meta_extractor = MetaFeatureExtractor_mask()          # (B, 5*C)
         self.meta_dense = nn.Sequential(
             nn.Linear(5 * ch, 32),
             nn.BatchNorm1d(32),
@@ -973,9 +973,9 @@ class MacroImuModel(nn.Module):
         # 2. Per-channel CNN ----------------------------------------------
         self.branches = nn.ModuleList([
             nn.Sequential(
-                MultiScaleConv1d(1, 12, kernel_sizes=[3, 5, 7]),      # 12 × 3 = 36
-                EnhancedResidualSEBlock(36, 48, 3, drop=0.3),
-                EnhancedResidualSEBlock(48, 48, 3, drop=0.3),
+                MultiScaleConv1d_mask(1, 12, kernel_sizes=[3, 5, 7]),      # 12 × 3 = 36
+                EnhancedResidualSEBlock_mask(36, 48, 3, drop=0.3),
+                EnhancedResidualSEBlock_mask(48, 48, 3, drop=0.3),
             )
             for _ in range(ch)
         ])                         # 出力: (B, L', 48) × ch → 結合後 (B, L', 48*ch)
@@ -987,13 +987,13 @@ class MacroImuModel(nn.Module):
         self.bilstm = nn.LSTM(rnn_in, 128, num_layers=2,
                               batch_first=True, bidirectional=True, dropout=0.2)
         self.lmu    = LMU(rnn_in, hidden_size=128, memory_size=256, theta=127)
-        self.noise  = GaussianNoise(0.09)          # そのまま加算-正規化用
+        self.noise  = GaussianNoise_mask(0.09)          # そのまま加算-正規化用
 
         # rnn_cat のチャンネル数を計算
         self.rnn_feat_dim = (128*2) + (128*2) + 128 + rnn_in   # 256+256+128+720 = 1360
 
         # 4. Attention Pooling --------------------------------------------
-        self.attention_pool = AttentionLayer(self.rnn_feat_dim)  # → (B, 1360)
+        self.attention_pool = AttentionLayer_mask(self.rnn_feat_dim)  # → (B, 1360)
 
         # 5. 分類ヘッド ----------------------------------------------------
         in_feat = self.rnn_feat_dim + 32        # pooled + meta
