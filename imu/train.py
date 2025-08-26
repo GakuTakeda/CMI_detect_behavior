@@ -118,8 +118,9 @@ def run(cfg: DictConfig):
                 x_imu = x_imu.to(device, non_blocking=True)    # [B, L, C_imu]
                 y      = y.to(device, non_blocking=True)       # [B] (long)
 
-                logits = model(x_imu)                          # [B, num_classes]
-                pred_ids = logits.argmax(dim=1).cpu().numpy()
+                outs = model(x_imu)                        # [B, num_classes]
+                logits18 = outs.get("logits18", next(iter(outs.values())))
+                pred_ids = logits18.argmax(dim=1).cpu().numpy()
                 true_ids = y.cpu().numpy()
 
                 submission.extend([gesture_classes[i] for i in pred_ids])
