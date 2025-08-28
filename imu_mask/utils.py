@@ -119,7 +119,6 @@ def labeling_for_macro(value):
         "Neck - scratch", "Cheek - pinch skin"
     ]
 
-    pull = ["Eyebrow - pull hair", "Eyelash - pull hair", "Forehead - pull hairline"]
     
     # BFRBリスト内の値であれば、そのインデックスを返す
     if value in BFRB:

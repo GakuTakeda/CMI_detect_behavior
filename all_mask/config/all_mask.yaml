@@ -22,7 +22,7 @@ train:
   dense_drop: 0.2
   conv_drop: 0.2
   noise_std: 0.09
-  mode: 8_class
+  mode: 18_class
 
   # Early stopping & 出力
   metric_name: val_loss
@@ -31,7 +31,11 @@ model:
   model:
     name: lstmgru
     num_classes: null
-    num_channels: 15
+    num_channels: null         # (= imu_dim + tof_dim に一致していると安全)
+
+  modalities:
+    imu_dim: null              
+    tof_dim: null           # ★ 追加：ToF/THMの特徴数
 
   meta:
     proj_dim: 32
@@ -39,13 +43,23 @@ model:
 
   cnn:
     multiscale:
-      out_per_kernel: 12        # 12 × len([3,5,7]) = 36ch をコード側で算出
-      kernel_sizes: [3, 5, 7]
+      out_per_kernel: 12
+      kernel_sizes: [3, 5, 7]   # （今回は使わず、二分岐のカーネルで管理。将来拡張用に残してOK）
     se:
-      out_channels: 48          # 各チャンネル枝の最終出力チャネル
+      out_channels: 48
       drop: 0.30
-      
-    pool_sizes: [2, 2]        # MaxPool1d を2回通す想定 → L_out ≈ floor(L/4)
+    pool_sizes: [2, 2]          # ★ ブロック数と同数 or 省略時は末尾を繰り返し
+
+  # 二分岐ごとのブロック構成（Keras相当をYAML化）
+  branches:
+    imu:
+      filters:   [64, 128]
+      kernels:   [3,   5]       # Residual+SEの各ブロックのカーネル
+      dropouts:  [0.10, 0.10]
+    tof:
+      filters:   [64, 128]
+      kernels:   [3,   3]       # 軽量Convブロック
+      dropouts:  [0.20, 0.20]
 
   rnn:
     hidden_size: 128
@@ -57,8 +71,9 @@ model:
     std: 0.09
 
   head:
-    hidden: 512
+    hidden: 512                 # 単一の全結合層
     dropout: 0.50
+
 
 aug:
   no_aug: false

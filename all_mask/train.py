@@ -9,7 +9,7 @@ import torch
 import numpy as np
 from utils import seed_everything, calc_f1
 
-@hydra.main(config_path="config", config_name="imu_mask", version_base="1.3")
+@hydra.main(config_path="config", config_name="all_mask", version_base="1.3")
 def run(cfg: DictConfig):
 
     caluculate = calc_f1()
@@ -25,6 +25,9 @@ def run(cfg: DictConfig):
             dm.prepare_data()  # "18_class" or "8_class"
         dm.setup()
         cfg.model.model.num_classes = dm.num_classes
+        cfg.model.model.num_channels = dm.imu_ch + dm.tof_ch  # (= THM+ToF の合計)
+        cfg.model.modalities.imu_dim = dm.imu_ch
+        cfg.model.modalities.tof_dim = dm.tof_ch  # (= THM+ToF の合計)
 
         model = litmodel_mask(
             cfg,
@@ -99,19 +102,19 @@ def run(cfg: DictConfig):
 
             if cfg.train.mode == "8_class":
                scores = {
-                    f"macro_score_of_fold_{fold+1}_imu_mask":   caluculate.macro_score(solution, submission),
+                    f"macro_score_of_fold_{fold+1}_mask":   caluculate.macro_score(solution, submission),
                 }     
             else:        
                 scores = {
-                    f"binary_score_of_fold_{fold+1}_imu_mask":  caluculate.binary_score(solution, submission),
-                    f"macro_score_of_fold_{fold+1}_imu_mask":   caluculate.macro_score(solution, submission),
+                    f"binary_score_of_fold_{fold+1}_mask":  caluculate.binary_score(solution, submission),
+                    f"macro_score_of_fold_{fold+1}_mask":   caluculate.macro_score(solution, submission),
                 }
 
             print("Fold scores:", scores)
             if cfg.train.mode == "8_class":
-               avg.append(scores[f"macro_score_of_fold_{fold+1}_imu_mask"])
+               avg.append(scores[f"macro_score_of_fold_{fold+1}_mask"])
             else:
-                avg.append(scores[f"binary_score_of_fold_{fold+1}_imu_mask"] + scores[f"macro_score_of_fold_{fold+1}_imu_mask"])
+                avg.append(scores[f"binary_score_of_fold_{fold+1}_mask"] + scores[f"macro_score_of_fold_{fold+1}_mask"])
 
             with open(dm.export_dir / f"scores_{fold+1}.json", "w") as f:
                 json.dump(scores, f, indent=2, ensure_ascii=False)

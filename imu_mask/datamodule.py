@@ -28,8 +28,12 @@ class GestureDataModule(L.LightningDataModule):
 
     def prepare_data(self):
         df = pd.read_csv(self.raw_dir / "train.csv")
+        if self.cfg.train.mode == "8_class":
+            df = df[df["gesture"].isin(labeling_for_macro("classes"))].reset_index(drop=True)
+            df["gesture_int"] = df["gesture"].apply(labeling_for_macro)
+        else:
+            df["gesture_int"] = df["gesture"].apply(labeling)
         df = feature_eng(df)
-        df["gesture_int"] = df["gesture"].apply(labeling)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         np.save(self.export_dir/"gesture_classes.npy", labeling("classes"))
 
@@ -49,8 +53,13 @@ class GestureDataModule(L.LightningDataModule):
 
         meta = {'gesture','gesture_int','sequence_type','behavior','orientation',
                 'row_id','subject','phase','sequence_id','sequence_counter'}
-        df["gesture_int"] = df["gesture"].apply(labeling)
-        self.num_classes  = len(labeling("classes"))
+        if self.cfg.train.mode == "8_class":
+            df = df[df["gesture"].isin(labeling_for_macro("classes"))].reset_index(drop=True)
+            df["gesture_int"] = df["gesture"].apply(labeling_for_macro)
+            self.num_classes  = len(labeling_for_macro("classes"))
+        else:
+            df["gesture_int"] = df["gesture"].apply(labeling)
+            self.num_classes  = len(labeling("classes"))
 
         feat_cols = [c for c in df.columns if c not in meta]
         self.feat_cols = feat_cols

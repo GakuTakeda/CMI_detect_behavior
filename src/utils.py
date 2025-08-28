@@ -84,13 +84,13 @@ def extract_seq(train, target):
         if df["gesture"].iloc[0] == target:
             list_.append(df)
     
-    return list_
+    return list_,
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-def plot_behavior(seq):
+def plot_behavior(seq, target: str):
     seq = feature_eng(seq)
 
     # ---------------- 行動→色 ----------------
@@ -154,6 +154,7 @@ def plot_behavior(seq):
     axes[0].legend(handles=legend_patches, loc="upper right", fontsize=8)
     axes[-1].set_xlabel("sequence_counter")
 
+    plt.title(target)
     plt.tight_layout()
     plt.show()
 
