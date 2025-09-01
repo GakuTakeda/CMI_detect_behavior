@@ -11,66 +11,65 @@ import optuna
 from optuna.integration import PyTorchLightningPruningCallback
 
 from datamodule import GestureDataModule
-from utils import litmodel_mask, seed_everything, calc_f1
+from utils import litmodel, seed_everything, calc_f1
 
 import warnings
 warnings.filterwarnings("ignore")
-
-# カーネル候補セット（YAMLの model.cnn.multiscale.kernel_sizes に反映）
 KS_CANDIDATES = {
     "k357":   (3, 5, 7),
     "k3711":  (3, 7, 11),
     "k579":   (5, 7, 9),
 }
-
-def _choose_pool_tuple(trial) -> list[int]:
-    # MaxPool1d を2回通す想定を守りつつ候補をチョイス
-    pool = trial.suggest_categorical("pool_sizes", [(2, 2), (2, 3), (3, 3)])
-    return list(pool)
-
 def objective(trial, cfg) -> float:
     scorer = calc_f1()
     seed_everything(cfg.data.random_seed)
 
     cfg_trial = deepcopy(cfg)
 
+    # ----- meta -----
+    cfg_trial.model.meta.proj_dim = trial.suggest_categorical("meta_proj_dim", [16, 32, 64, 128])
+    cfg_trial.model.meta.dropout  = trial.suggest_float("meta_dropout", 0.0, 0.5)
 
-    # --- Augmentations（キーは維持）---
-    # 時間シフト
-    cfg_trial.aug.p_time_shift    = trial.suggest_float("aug_p_time_shift", 0.45, 0.80)
-    cfg_trial.aug.max_shift_ratio = trial.suggest_float("aug_max_shift_ratio", 0.15, 0.30)
+    # ----- cnn.multiscale -----
+    cfg_trial.model.cnn.multiscale.out_per_kernel = trial.suggest_categorical(
+        "ms_out_per_kernel", [8, 12, 16, 24, 32]
+    )
+    ks_key = trial.suggest_categorical("ms_kernel_key", list(KS_CANDIDATES.keys()))
+    cfg_trial.model.cnn.multiscale.kernel_sizes = list(KS_CANDIDATES[ks_key])
 
-    # ブロックドロップアウト（上位は2,2固定 & 短ブロック）
-    cfg_trial.aug.p_block_dropout = trial.suggest_float("aug_p_block_dropout", 0.06, 0.18)
-    nb_min, nb_max = 2, 2
-    cfg_trial.aug.n_blocks = [nb_min, nb_max]
-    bl_min = 5
-    bl_max = trial.suggest_int("aug_block_len_max", 5, 6)
-    cfg_trial.aug.block_len = [bl_min, bl_max]
+    # ----- cnn.se -----
+    cfg_trial.model.cnn.se.out_channels = trial.suggest_categorical(
+        "se_out_channels", [32, 48, 64, 96]
+    )
+    cfg_trial.model.cnn.se.drop = trial.suggest_float("se_drop", 0.0, 0.5)
 
-    # IMUノイズ系
-    cfg_trial.aug.p_imu_jitter    = trial.suggest_float("aug_p_imu_jitter", 0.20, 0.50)
-    cfg_trial.aug.imu_sigma       = trial.suggest_float("aug_imu_sigma", 0.010, 0.030)
+    # ----- rnn -----
+    cfg_trial.model.rnn.bidirectional = trial.suggest_categorical("rnn_bidir", [True, False])
+    base_hidden = trial.suggest_int("rnn_hidden_size", 64, 256, step=32)
+    # 片方向のときは少し底上げ（情報量を補うため）
+    if not cfg_trial.model.rnn.bidirectional:
+        base_hidden = max(base_hidden, 96)
+    cfg_trial.model.rnn.hidden_size = base_hidden
 
-    cfg_trial.aug.p_imu_scale     = trial.suggest_float("aug_p_imu_scale", 0.10, 0.30)
-    cfg_trial.aug.imu_scale_sigma = trial.suggest_float("aug_imu_scale_sigma", 0.08, 0.16)
+    cfg_trial.model.rnn.num_layers = trial.suggest_int("rnn_num_layers", 1, 3)
+    cfg_trial.model.rnn.dropout    = trial.suggest_float("rnn_dropout", 0.0, 0.6)
 
-    cfg_trial.aug.p_imu_drift     = trial.suggest_float("aug_p_imu_drift", 0.25, 0.45)
-    cfg_trial.aug.drift_std       = trial.suggest_float("aug_drift_std", 0.0010, 0.0070)
-    cfg_trial.aug.drift_clip      = trial.suggest_float("aug_drift_clip", 0.30, 0.50)
+    # ----- noise -----
+    cfg_trial.model.noise.std = trial.suggest_float("noise_std", 0.0, 0.15)
 
-    cfg_trial.aug.p_imu_small_rot = trial.suggest_float("aug_p_imu_small_rot", 0.25, 0.50)
-    cfg_trial.aug.rot_deg         = trial.suggest_float("aug_rot_deg", 3.0, 8.0)
+    # ----- head -----
+    cfg_trial.model.head.hidden  = trial.suggest_int("head_hidden", 256, 1024, step=64)
+    cfg_trial.model.head.dropout = trial.suggest_float("head_dropout", 0.2, 0.7)
+
+    # ----- 学習系（任意だが推奨）-----
+    cfg_trial.train.lr_init      = trial.suggest_float("lr_init", 1e-4, 3e-3, log=True)
+    cfg_trial.train.weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
 
     n_splits = cfg_trial.data.n_splits
-    device_cfg = cfg_trial.train.device
-    # lightning の accelerator は "gpu"/"cpu"/"auto" 想定なので "cuda" を吸収
-    accelerator = "gpu" if device_cfg in ("cuda", "gpu") else device_cfg
-    devices = 1 if accelerator == "gpu" else None
-
+    device   = cfg_trial.train.device
     fold_scores: list[float] = []
 
-    # ===== K-Fold =====
+    # ---- K-Fold ループ ----
     for fold in range(n_splits):
         print(f"\n===== Fold {fold} / {n_splits-1} (trial #{trial.number}) =====")
 
@@ -79,15 +78,15 @@ def objective(trial, cfg) -> float:
             dm.prepare_data()  # 特徴列・スケーラ等を作成
         dm.setup()
 
-        model = litmodel_mask(
+        model = litmodel(
             cfg=cfg_trial,
-            num_classes=18,  # YAMLの num_classes は学習側で決め打ちのためここは維持
+            num_classes=18,
             lr_init=cfg_trial.train.lr_init,
             weight_decay=cfg_trial.train.weight_decay,
             class_weight=dm.class_weight,
         )
 
-        # trial / fold ごとに ckpt 保存パスを分ける
+        # trial / fold ごとに ckpt 保存パスを分ける（上書き回避）
         ckpt_dir = dm.export_dir / f"trial_{trial.number}" / f"fold_{fold+1}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -102,13 +101,14 @@ def objective(trial, cfg) -> float:
                 save_top_k=1,
                 mode="max",
             ),
+            # Optuna のプルーニング（val/acc を監視）
             PyTorchLightningPruningCallback(trial, monitor="val/acc"),
         ]
 
         trainer = L.Trainer(
             max_epochs=cfg_trial.train.epochs,
-            accelerator=accelerator,               # "gpu" / "cpu" / "auto"
-            devices=devices,                       # GPU1枚想定
+            accelerator=device,                      # "gpu" / "cpu" / "auto"
+            devices=1 if device != "cpu" else None, # GPU1枚想定
             log_every_n_steps=50,
             callbacks=callbacks,
             deterministic=False,
@@ -121,31 +121,31 @@ def objective(trial, cfg) -> float:
             val_dataloaders=dm.val_dataloader_imu(),      # Pad + Mask
         )
 
-        # ===== 評価 =====
+        # ====== 評価（foldスコアを計算） ======
         print("start evaluation")
         gesture_classes = np.load(dm.export_dir / "gesture_classes.npy", allow_pickle=True)
 
         with torch.no_grad():
             best_ckpt = os.path.join(ckpt_dir, f"best_of_fold_imu_{fold+1}.ckpt")
-            model = litmodel_mask.load_from_checkpoint(
+            model = litmodel.load_from_checkpoint(
                 checkpoint_path=best_ckpt,
                 cfg=cfg_trial,
                 num_classes=18,
                 lr_init=cfg_trial.train.lr_init,
                 weight_decay=cfg_trial.train.weight_decay,
                 class_weight=dm.class_weight,
-            ).eval().to(accelerator if accelerator != "gpu" else "cuda")
+            ).eval().to(device)
 
             submission, solution = [], []
             for batch in dm.val_dataloader_imu():
+                # 検証は通常 (x, lengths, mask, y)。万一 train 用collateが来ても耐性あり
                 if len(batch) == 4:
                     x, lengths, mask, y = batch
                 elif len(batch) == 6:
-                    x, lengths, mask, y, _, _ = batch
+                    x, lengths, mask, y, _, _ = batch  # mixup の y_b / lam は無視
                 else:
                     raise RuntimeError(f"Unexpected batch format: len={len(batch)}")
 
-                device = torch.device("cuda") if accelerator == "gpu" else torch.device("cpu")
                 x = x.to(device, non_blocking=True)
                 lengths = lengths.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
@@ -157,26 +157,28 @@ def objective(trial, cfg) -> float:
                 submission.extend([gesture_classes[i] for i in pred_ids])
                 solution.extend([gesture_classes[i] for i in true_ids])
 
+            # 目的関数：2指標の和（必要なら重み付け可）
             fold_score = (
                 scorer.binary_score(solution, submission) +
                 scorer.macro_score(solution, submission)
             )
             fold_scores.append(float(fold_score))
 
-        # プルーニング判定（fold途中経過）
+        # ---- プルーニング判定（fold の途中経過）----
         trial.report(float(np.mean(fold_scores)), step=fold)
         if trial.should_prune():
             raise optuna.TrialPruned()
 
+    # ---- 最終：fold平均を返す / 併せて user_attr に全foldを保存 ----
     mean_score = float(np.mean(fold_scores))
-    trial.set_user_attr("fold_scores", fold_scores)
+    trial.set_user_attr("fold_scores", fold_scores)  # list[float]（可視化でそのまま使える）
     return mean_score
 
 
-@hydra.main(config_path="config", config_name="imu_mask", version_base="1.3")
+@hydra.main(config_path="config", config_name="config", version_base="1.3")
 def run(cfg: DictConfig):
     study = optuna.create_study(
-        study_name="imu_tuning_4",
+        study_name="imu_tuning_3",
         storage="sqlite:///lstmgru_tuning.db",
         load_if_exists=True,
         direction="maximize",

@@ -410,240 +410,176 @@ def mixup_pad_collate_fn(alpha: float = 0.2, return_soft: bool = False):
 
 def _randu(a=0.0, b=1.0): return np.random.uniform(a, b)
 
-class AugmentMultiModal:
+class AugmentIMUOnly:
     """
-    x: np.ndarray [L, C_all] を受け取り、同形状を返す
-    時間系の変換は x 全体に一括 → その後に各モダリティ別ノイズ
+    入出力:
+      imu: [L, C_imu]  (float32)
+    返り値も同形状（maskなし・固定長のまま）
     """
-    def __init__(
-        self,
-        idx_imu, idx_thm, idx_tof,
-        # 時間系（全体）
+    def __init__(self,
         p_time_shift=0.7, max_shift_ratio=0.1,
         p_time_warp=0.5,  warp_min=0.9, warp_max=1.1,
         p_block_dropout=0.5, n_blocks=(1,3), block_len=(2,6),
-        pad_value=0.0,
-        # IMUノイズ
         p_imu_jitter=0.9, imu_sigma=0.03,
         p_imu_scale=0.5,  imu_scale_sigma=0.03,
         p_imu_drift=0.5,  drift_std=0.003, drift_clip=0.3,
         p_imu_small_rot=0.0, rot_deg=5.0,
-        # THM/ToF ノイズ（列ベース）
-        p_thm_ch_drop=0.2, thm_drop_frac=0.05, thm_sigma=0.01,
-        p_tof_ch_drop=0.2, tof_drop_frac=0.05, tof_sigma=0.01,
+        pad_value=0.0,
     ):
-        self.idx_imu = np.asarray(idx_imu)
-        self.idx_thm = np.asarray(idx_thm)
-        self.idx_tof = np.asarray(idx_tof)
+        self.p_time_shift = p_time_shift
+        self.max_shift_ratio = max_shift_ratio
+        self.p_time_warp = p_time_warp
+        self.warp_min, self.warp_max = warp_min, warp_max
+        self.p_block_dropout = p_block_dropout
+        self.n_blocks, self.block_len = n_blocks, block_len
+        self.p_imu_jitter = p_imu_jitter
+        self.imu_sigma = imu_sigma
+        self.p_imu_scale = p_imu_scale
+        self.imu_scale_sigma = imu_scale_sigma
+        self.p_imu_drift = p_imu_drift
+        self.drift_std = drift_std
+        self.drift_clip = drift_clip
+        self.p_imu_small_rot = p_imu_small_rot
+        self.rot_deg = rot_deg
+        self.pad_value = pad_value
 
-        # 時間系
-        self.p_time_shift=p_time_shift; self.max_shift_ratio=max_shift_ratio
-        self.p_time_warp=p_time_warp;   self.warp_min=warp_min; self.warp_max=warp_max
-        self.p_block_dropout=p_block_dropout; self.n_blocks=n_blocks; self.block_len=block_len
-        self.pad_value=pad_value
-
-        # IMU
-        self.p_imu_jitter=p_imu_jitter; self.imu_sigma=imu_sigma
-        self.p_imu_scale=p_imu_scale;   self.imu_scale_sigma=imu_scale_sigma
-        self.p_imu_drift=p_imu_drift;   self.drift_std=drift_std; self.drift_clip=drift_clip
-        self.p_imu_small_rot=p_imu_small_rot; self.rot_deg=rot_deg
-
-        # THM/ToF
-        self.p_thm_ch_drop=p_thm_ch_drop; self.thm_drop_frac=thm_drop_frac; self.thm_sigma=thm_sigma
-        self.p_tof_ch_drop=p_tof_ch_drop; self.tof_drop_frac=tof_drop_frac; self.tof_sigma=tof_sigma
-
-        self._np = np; self._torch = torch; self._F = F
-
-    # ---- 時間系（全体）----
+    # ---------- time ops ----------
     def _time_shift(self, x, shift):
         L = x.shape[0]
         if shift == 0: return x
-        out = self._np.full_like(x, self.pad_value)
+        out = np.full_like(x, self.pad_value)
         if shift > 0:
             out[shift:] = x[:L-shift]
         else:
             out[:L+shift] = x[-shift:]
         return out
 
-    def _time_warp(self, x, scale):
-        # 線形補間で L→Lp→L
-        t = self._torch.from_numpy(x.astype(self._np.float32)).transpose(0,1).unsqueeze(0)  # [1,C,L]
-        L = t.size(-1)
+    def _time_warp(self, x: np.ndarray, scale: float) -> np.ndarray:
+        L = x.shape[0]
         Lp = max(2, int(round(L * scale)))
-        y  = self._F.interpolate(t, size=Lp, mode="linear", align_corners=False)
-        y  = self._F.interpolate(y, size=L,  mode="linear", align_corners=False)
+        t = torch.from_numpy(x.astype(np.float32)).transpose(0,1).unsqueeze(0)  # [1,C,L]
+        y = F.interpolate(t, size=Lp, mode="linear", align_corners=False)
+        y = F.interpolate(y, size=L,  mode="linear", align_corners=False)
         return y.squeeze(0).transpose(0,1).contiguous().numpy()
 
     def _block_dropout(self, x):
         L = x.shape[0]
-        nb = self._np.random.randint(self.n_blocks[0], self.n_blocks[1]+1)
+        nb = np.random.randint(self.n_blocks[0], self.n_blocks[1]+1)
         for _ in range(nb):
-            bl = self._np.random.randint(self.block_len[0], self.block_len[1]+1)
-            s  = self._np.random.randint(0, max(1, L - bl + 1))
+            bl = np.random.randint(self.block_len[0], self.block_len[1]+1)
+            s = np.random.randint(0, max(1, L - bl + 1))
             x[s:s+bl] = self.pad_value
         return x
 
-    # ---- IMU ノイズ ----
-    def _imu_jitter(self, m): return m + self._np.random.randn(*m.shape).astype(self._np.float32) * self.imu_sigma
-    def _imu_scale(self, m):
-        scale = (1.0 + self._np.random.randn(m.shape[1]).astype(self._np.float32) * self.imu_scale_sigma)
-        return m * scale[None, :]
-    def _imu_drift(self, m):
-        L,C = m.shape
-        drift = self._np.cumsum(self._np.random.randn(L,C).astype(self._np.float32) * self.drift_std, axis=0)
-        self._np.clip(drift, -self.drift_clip, self.drift_clip, out=drift)
-        return m + drift
-    def _imu_small_rot(self, m):
-        # x/y/z の3軸が連続している前提なら軽い回転（チャネルが >=6 なら加速度&ジャイロに同回転）
-        th = self._np.deg2rad(self.rot_deg) * self._np.random.uniform(-1,1)
-        Rz = self._np.array([[ self._np.cos(th), -self._np.sin(th), 0],
-                             [ self._np.sin(th),  self._np.cos(th), 0],
-                             [ 0, 0, 1]], dtype=self._np.float32)
-        out = m.copy()
-        if m.shape[1] >= 3: out[:, :3] = (m[:, :3] @ Rz.T).astype(self._np.float32)
-        if m.shape[1] >= 6: out[:, 3:6] = (m[:, 3:6] @ Rz.T).astype(self._np.float32)
-        return out
+    # ---------- imu ops ----------
+    def _imu_jitter(self, imu):        # add noise
+        return imu + np.random.randn(*imu.shape).astype(np.float32) * self.imu_sigma
 
-    # ---- 汎用：列ドロップ＋ノイズ ----
-    def _ch_drop_and_noise(self, m, p_drop, drop_frac, sigma):
-        if m.shape[1] == 0: return m
-        if self._np.random.rand() < p_drop and m.shape[1] > 0:
-            k = max(1, int(round(m.shape[1] * drop_frac)))
-            cols = self._np.random.choice(m.shape[1], size=k, replace=False)
-            m[:, cols] = 0.0
-        if sigma > 0:
-            m = m + self._np.random.randn(*m.shape).astype(self._np.float32) * sigma
-        return m
+    def _imu_scale(self, imu):         # per-channel scale
+        scale = (1.0 + np.random.randn(imu.shape[1]).astype(np.float32) * self.imu_scale_sigma)
+        return imu * scale[None, :]
 
-    # ---- main ----
-    def __call__(self, x):
-        x = x.astype(self._np.float32, copy=True)
+    def _imu_drift(self, imu):
+        L, C = imu.shape
+        drift = np.cumsum(np.random.randn(L, C).astype(np.float32) * self.drift_std, axis=0)
+        np.clip(drift, -self.drift_clip, self.drift_clip, out=drift)
+        return imu + drift
 
-        # --- 全体の時間操作 ---
-        L = x.shape[0]
-        if self._np.random.rand() < self.p_time_shift:
-            shift = int(round(self._np.random.uniform(-self.max_shift_ratio, self.max_shift_ratio) * L))
-            x = self._time_shift(x, shift)
-        if self._np.random.rand() < self.p_time_warp:
-            s = float(self._np.random.uniform(self.warp_min, self.warp_max))
-            x = self._time_warp(x, s)
-        if self._np.random.rand() < self.p_block_dropout:
-            x = self._block_dropout(x)
+    def _imu_small_rot(self, imu):
+        th = np.deg2rad(self.rot_deg) * np.random.uniform(-1,1)
+        Rz = np.array([[ np.cos(th), -np.sin(th), 0],
+                       [ np.sin(th),  np.cos(th), 0],
+                       [ 0,           0,          1]], dtype=np.float32)
+        def rot3(block):
+            return (block @ Rz.T).astype(np.float32)
+        imu_out = imu.copy()
+        if imu.shape[1] >= 3:
+            imu_out[:, :3] = rot3(imu[:, :3])
+        if imu.shape[1] >= 6:
+            imu_out[:, 3:6] = rot3(imu[:, 3:6])
+        return imu_out
 
-        # --- モダリティ別ノイズ ---
-        def view(idx): return x[:, idx] if idx.size > 0 else x[:, 0:0]
+    # ---------- main ----------
+    def __call__(self, imu: np.ndarray):
+        L = imu.shape[0]
+        if np.random.rand() < self.p_time_shift:
+            shift = int(np.round(_randu(-self.max_shift_ratio, self.max_shift_ratio) * L))
+            imu = self._time_shift(imu, shift)
+        if np.random.rand() < self.p_time_warp:
+            s = _randu(self.warp_min, self.warp_max)
+            imu = self._time_warp(imu, s)
+        if np.random.rand() < self.p_block_dropout:
+            imu = self._block_dropout(imu)
+        if np.random.rand() < self.p_imu_jitter: imu = self._imu_jitter(imu)
+        if np.random.rand() < self.p_imu_scale:  imu = self._imu_scale(imu)
+        if np.random.rand() < self.p_imu_drift:  imu = self._imu_drift(imu)
+        if self.p_imu_small_rot > 0 and np.random.rand() < self.p_imu_small_rot:
+            imu = self._imu_small_rot(imu)
+        return imu.astype(np.float32)
 
-        # IMU
-        if self.idx_imu.size > 0:
-            imu = view(self.idx_imu)
-            if self._np.random.rand() < 1.0:                  # フラグで順序調整OK
-                if self._np.random.rand() < self.p_imu_jitter: imu = self._imu_jitter(imu)
-                if self._np.random.rand() < self.p_imu_scale:  imu = self._imu_scale(imu)
-                if self._np.random.rand() < self.p_imu_drift:  imu = self._imu_drift(imu)
-                if self.p_imu_small_rot > 0 and self._np.random.rand() < self.p_imu_small_rot:
-                    imu = self._imu_small_rot(imu)
-            x[:, self.idx_imu] = imu
+class GaussianNoise_mask(nn.Module):
+    def __init__(self, stddev=0.1):
+        super().__init__()
+        self.stddev = stddev
 
-        # THM
-        if self.idx_thm.size > 0:
-            thm = view(self.idx_thm)
-            thm = self._ch_drop_and_noise(thm, self.p_thm_ch_drop, self.thm_drop_frac, self.thm_sigma)
-            x[:, self.idx_thm] = thm
-
-        # ToF
-        if self.idx_tof.size > 0:
-            tof = view(self.idx_tof)
-            tof = self._ch_drop_and_noise(tof, self.p_tof_ch_drop, self.tof_drop_frac, self.tof_sigma)
-            x[:, self.idx_tof] = tof
-
-        return x.astype(self._np.float32)
-
-
-def _ensure_list(x, n=None):
-    if isinstance(x, (list, tuple)):
-        return list(x) if (n is None or len(x) == n) else (list(x) + [x[-1]]*(n-len(x)))
-    return [x] if n is None else [x]*n
-
-def _down_len(lengths: torch.Tensor, pool_sizes: Sequence[int]) -> torch.Tensor:
+    def forward(self, x):
+        if self.training and self.stddev > 0:
+            noise = torch.randn_like(x) * self.stddev
+            return x + noise
+        return x
+    
+    
+def down_len(lengths: torch.Tensor, pool_sizes: Sequence[int]) -> torch.Tensor:
+    """Conv後に現れる各 MaxPool1d の pool_size を順に適用して長さを更新"""
     l = lengths.clone()
     for p in pool_sizes:
-        l = torch.div(l, int(p), rounding_mode="floor")
+        l = torch.div(l, p, rounding_mode="floor")
     return l.clamp_min(1)
 
-class GaussianNoise(nn.Module):
-    def __init__(self, std: float = 0.0):
+class AttentionLayer_mask(nn.Module):
+    """マスク対応のシンプルなアテンションプーリング"""
+    def __init__(self, in_dim: int, hidden: int = 128):
         super().__init__()
-        self.std = float(std)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training and self.std > 0:
-            return x + torch.randn_like(x) * self.std
-        return x
+        self.w = nn.Linear(in_dim, hidden, bias=False)
+        self.v = nn.Linear(hidden, 1, bias=False)
 
-class SE1D(nn.Module):
-    def __init__(self, channels: int, reduction: int = 8):
-        super().__init__()
-        hidden = max(1, channels // reduction)
-        self.fc1 = nn.Linear(channels, hidden)
-        self.fc2 = nn.Linear(hidden, channels)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = x.mean(dim=-1)                 # [B,C]
-        w = F.relu(self.fc1(w), inplace=True)
-        w = torch.sigmoid(self.fc2(w))     # [B,C]
-        return x * w.unsqueeze(-1)
-
-class ResidualSEConv1D(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int, pool: int = 2, drop: float = 0.3):
-        super().__init__()
-        pad = k // 2
-        self.conv1 = nn.Conv1d(in_ch, out_ch, k, padding=pad, bias=False)
-        self.bn1   = nn.BatchNorm1d(out_ch)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, k, padding=pad, bias=False)
-        self.bn2   = nn.BatchNorm1d(out_ch)
-        self.se    = SE1D(out_ch, reduction=8)
-        self.short = (nn.Identity() if in_ch == out_ch
-                      else nn.Sequential(nn.Conv1d(in_ch, out_ch, 1, bias=False),
-                                         nn.BatchNorm1d(out_ch)))
-        self.pool  = nn.MaxPool1d(pool)
-        self.drop  = nn.Dropout(drop)
-        self.pool_size = pool
-    def forward(self, x):
-        res = self.short(x)
-        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
-        x = F.relu(self.bn2(self.conv2(x)), inplace=True)
-        x = self.se(x)
-        x = F.relu(x + res, inplace=True)
-        x = self.pool(x)
-        x = self.drop(x)
-        return x
-
-class ConvBlock1D(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 3, pool: int = 2, drop: float = 0.2):
-        super().__init__()
-        pad = k // 2
-        self.conv = nn.Conv1d(in_ch, out_ch, k, padding=pad, bias=False)
-        self.bn   = nn.BatchNorm1d(out_ch)
-        self.pool = nn.MaxPool1d(pool)
-        self.drop = nn.Dropout(drop)
-        self.pool_size = pool
-    def forward(self, x):
-        x = F.relu(self.bn(self.conv(x)), inplace=True)
-        x = self.pool(x)
-        x = self.drop(x)
-        return x
-
-class TimeAttention(nn.Module):
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.score = nn.Linear(in_dim, 1)
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        # x: [B,T,D], mask: [B,T] (True=valid)
-        s = torch.tanh(self.score(x)).squeeze(-1)     # [B,T]
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: [B,T,D], mask: [B,T] (True=有効). Noneなら全有効
+        return: [B,D]
+        """
+        s = self.v(torch.tanh(self.w(x))).squeeze(-1)   # [B,T]
         if mask is not None:
-            s = s.masked_fill(~mask, float("-inf"))
-        w = F.softmax(s, dim=1)                       # [B,T]
-        ctx = torch.bmm(w.unsqueeze(1), x).squeeze(1) # [B,D]
-        return ctx
-    
+            s = s.masked_fill(~mask, -1e9)
+        w = s.softmax(dim=1)                            # [B,T]
+        pooled = torch.bmm(w.unsqueeze(1), x).squeeze(1)  # [B,D]
+        return pooled
+
+
+class MultiScaleConv1d_mask(nn.Module):
+    """Multi-scale temporal convolution block (長さ保存: stride=1, SAME padding相当)"""
+    def __init__(self, in_channels, out_per_kernel, kernel_sizes=[3, 5, 7]):
+        super().__init__()
+        self.kernel_sizes = kernel_sizes
+        self.convs = nn.ModuleList()
+        for ks in kernel_sizes:
+            pad = ks // 2  # 奇数カーネル推奨（長さ保存）
+            self.convs.append(nn.Sequential(
+                nn.Conv1d(in_channels, out_per_kernel, ks, padding=pad, bias=False),
+                nn.BatchNorm1d(out_per_kernel),
+                nn.ReLU(inplace=True)
+            ))
+
+    @property
+    def out_channels(self):
+        # 合計出力チャネル
+        return sum(block[0].out_channels for block in self.convs)
+
+    def forward(self, x):
+        outputs = [conv(x) for conv in self.convs]  # list of [N, out_per_kernel, L]
+        return torch.cat(outputs, dim=1)            # [N, out_per_kernel*K, L]
+
+
 class EnhancedSEBlock_mask(nn.Module):
     """Avg/Maxの両方でSE"""
     def __init__(self, channels, reduction=8):
@@ -664,6 +600,7 @@ class EnhancedSEBlock_mask(nn.Module):
         y = torch.cat([avg_y, max_y], dim=1)
         y = self.excitation(y).view(b, c, 1)
         return x * y.expand_as(x)
+
 
 class EnhancedResidualSEBlock_mask(nn.Module):
     """
@@ -695,31 +632,8 @@ class EnhancedResidualSEBlock_mask(nn.Module):
         out = self.pool(out)
         out = self.drop(out)
         return out                        # (N, C_out, floor(L/p))
-    
 
-class MultiScaleConv1d_mask(nn.Module):
-    """Multi-scale temporal convolution block (長さ保存: stride=1, SAME padding相当)"""
-    def __init__(self, in_channels, out_per_kernel, kernel_sizes=[3, 5, 7]):
-        super().__init__()
-        self.kernel_sizes = kernel_sizes
-        self.convs = nn.ModuleList()
-        for ks in kernel_sizes:
-            pad = ks // 2  # 奇数カーネル推奨（長さ保存）
-            self.convs.append(nn.Sequential(
-                nn.Conv1d(in_channels, out_per_kernel, ks, padding=pad, bias=False),
-                nn.BatchNorm1d(out_per_kernel),
-                nn.ReLU(inplace=True)
-            ))
 
-    @property
-    def out_channels(self):
-        # 合計出力チャネル
-        return sum(block[0].out_channels for block in self.convs)
-
-    def forward(self, x):
-        outputs = [conv(x) for conv in self.convs]  # list of [N, out_per_kernel, L]
-        return torch.cat(outputs, dim=1)            # [N, out_per_kernel*K, L]
-    
 class MetaFeatureExtractor_mask(nn.Module):
     """
     時系列マスク付きの簡易メタ特徴 (各Ch 5個: mean, std, min, max, abs-mean)
@@ -755,29 +669,90 @@ class MetaFeatureExtractor_mask(nn.Module):
         feats = torch.cat([mean, std, x_min, x_max, abs_mean], dim=1)  # [B, 5*C]
         return feats
 
+# ===== WaveNet: gated dilated conv blocks =====
+class WaveNetGatedBlock_mask(nn.Module):
+    """
+    Gated Tanh-Sigmoid + Residual + Skip
+    入出力: [B,T,Cin] -> [B,T,Cin]（長さ保存）
+    """
+    def __init__(self, in_ch, res_ch=128, skip_ch=256, k=3, dilation=1, causal=False, drop=0.2):
+        super().__init__()
+        self.causal = causal
+        pad = dilation * (k - 1) if causal else dilation * (k - 1) // 2
 
-# ===== Model: per-channel CNN → (TimeMixer) → NoiseSkip → AttnPool → Head =====
-class ModelVariant_WAVE_mask(nn.Module):  # ← クラス名は据え置き（中身はWaveNet無し）
+        # フィルタ/ゲート分岐
+        self.conv_f = nn.Conv1d(in_ch, res_ch, k, padding=pad, dilation=dilation)
+        self.conv_g = nn.Conv1d(in_ch, res_ch, k, padding=pad, dilation=dilation)
+
+        # 残差＆スキップ
+        self.res_out  = nn.Conv1d(res_ch, in_ch, 1)
+        self.skip_out = nn.Conv1d(res_ch, skip_ch, 1)
+        self.drop     = nn.Dropout(drop)
+
+    def forward(self, x_btC):                   # x: [B,T,C]
+        x = x_btC.transpose(1, 2)               # -> [B,C,T]
+        y = torch.tanh(self.conv_f(x)) * torch.sigmoid(self.conv_g(x))
+        if self.causal:
+            # 右側（未来）を切る
+            cut = y.size(-1) - x.size(-1)
+            if cut > 0:
+                y = y[..., :-cut]
+        y = self.drop(y)
+        skip = self.skip_out(y)                 # [B,skip,T]
+        res  = self.res_out(y) + x              # [B,C,T]
+        return res.transpose(1, 2), skip.transpose(1, 2)  # -> [B,T,*]
+
+
+class WaveNetStack_mask(nn.Module):
+    """
+    dilations = base*(2**i) を n_stacks 回繰り返し。
+    Skip を集約して 1x1 Conv で out_ch へ射影。
+    出力: [B,T,out_ch]
+    """
+    def __init__(self, in_ch, res_ch=128, skip_ch=256, out_ch=None,
+                 k=3, n_layers=6, n_stacks=2, base_dilation=1,
+                 causal=False, drop=0.2):
+        super().__init__()
+        blocks = []
+        for _ in range(n_stacks):
+            for i in range(n_layers):
+                d = base_dilation * (2 ** i)
+                blocks.append(WaveNetGatedBlock_mask(in_ch, res_ch, skip_ch, k, d, causal, drop))
+        self.blocks = nn.ModuleList(blocks)
+
+        self.proj = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv1d(skip_ch, skip_ch, 1),
+            nn.ReLU(),
+            nn.Conv1d(skip_ch, out_ch or in_ch, 1),
+        )
+        self.out_ch = (out_ch or in_ch)
+
+    def forward(self, x_btC):                   # [B,T,in_ch]
+        skips = None
+        h = x_btC
+        for blk in self.blocks:
+            h, s = blk(h)                       # h: [B,T,in_ch], s: [B,T,skip_ch]
+            skips = s if skips is None else (skips + s)
+        y = self.proj(skips.transpose(1, 2)).transpose(1, 2)  # [B,T,out_ch]
+        return y
+
+
+# ===== Model: per-channel CNN → WaveNet → NoiseSkip → AttnPool → Head =====
+class ModelVariant_WAVE_mask(nn.Module):  # ← クラス名は据え置き（内部はWaveNet）
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        C_total = int(cfg.model.model.num_channels)
-        num_classes = int(cfg.model.model.num_classes)
-
-        # ---- modalities ----
-        imu_dim = int(getattr(cfg.model.modalities, "imu_dim", C_total))
-        tof_dim = int(getattr(cfg.model.modalities, "tof_dim", 0))
-        assert imu_dim + tof_dim == C_total, "num_channels は imu_dim + tof_dim と一致させて下さい。"
-        self.imu_dim, self.tof_dim = imu_dim, tof_dim
-        self.use_coattn = (imu_dim > 0 and tof_dim > 0)
+        C = cfg.model.model.num_channels
+        num_classes = cfg.model.model.num_classes
 
         # ----- Meta -----
         self.meta_extractor = MetaFeatureExtractor_mask()
         self.meta_dense = nn.Sequential(
-            nn.Linear(5 * C_total, int(cfg.model.meta.proj_dim)),
-            nn.BatchNorm1d(int(cfg.model.meta.proj_dim)),
+            nn.Linear(5 * C, cfg.model.meta.proj_dim),
+            nn.BatchNorm1d(cfg.model.meta.proj_dim),
             nn.ReLU(),
-            nn.Dropout(float(cfg.model.meta.dropout)),
+            nn.Dropout(cfg.model.meta.dropout),
         )
 
         # ----- Per-channel CNN branches -----
@@ -789,80 +764,58 @@ class ModelVariant_WAVE_mask(nn.Module):  # ← クラス名は据え置き（�
         branch = lambda: nn.Sequential(
             MultiScaleConv1d_mask(1, out_per_kernel, kernel_sizes=ks),   # [N, ms_out, L]
             EnhancedResidualSEBlock_mask(ms_out, se_out, k=3,
-                                         pool_size=int(cfg.model.cnn.pool_sizes[0]),
-                                         drop=float(cfg.model.cnn.se.drop)),
+                                         pool_size=cfg.model.cnn.pool_sizes[0],
+                                         drop=cfg.model.cnn.se.drop),
             EnhancedResidualSEBlock_mask(se_out, se_out, k=3,
-                                         pool_size=int(cfg.model.cnn.pool_sizes[1]),
-                                         drop=float(cfg.model.cnn.se.drop)),
+                                         pool_size=cfg.model.cnn.pool_sizes[1],
+                                         drop=cfg.model.cnn.se.drop),
         )
-        self.branches = nn.ModuleList([branch() for _ in range(C_total)])
+        self.branches = nn.ModuleList([branch() for _ in range(C)])
+        per_step_feat = se_out * C                                      # CNN後の時刻あたり特徴
 
-        # 各モダリティの時刻特徴次元
-        per_step_imu = se_out * imu_dim
-        per_step_tof = se_out * tof_dim
-        per_step_all = se_out * C_total
-
-        # ----- Co-Attention (IMU↔ToF) -----
-        if self.use_coattn:
-            dim = int(getattr(cfg.model.coattn, "dim", 256))
-            heads = int(getattr(cfg.model.coattn, "num_heads", 4))
-            drop  = float(getattr(cfg.model.coattn, "dropout", 0.1))
-
-            self.proj_q_imu  = nn.Linear(per_step_imu, dim, bias=False)
-            self.proj_kv_tof = nn.Linear(per_step_tof, dim, bias=False)
-            self.proj_q_tof  = nn.Linear(per_step_tof, dim, bias=False)
-            self.proj_kv_imu = nn.Linear(per_step_imu, dim, bias=False)
-
-            self.attn_imu = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
-            self.attn_tof = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
-            self.ln_imu = nn.LayerNorm(dim)
-            self.ln_tof = nn.LayerNorm(dim)
-
-            fused_in = 2 * dim
-        else:
-            fused_in = per_step_all  # 片側のみの時は全結合特徴を使う
-
-        # ----- TimeMixer（WaveNetの完全撤去・代替の1×1線形）-----
-        # cfg.model.timemix を読み取り（無ければ既定）
         def _get(cfgobj, key, default):
             if cfgobj is None:
                 return default
             val = getattr(cfgobj, key, default)
+            # None / "null" / "None" / "" は default 扱い
             if val is None or (isinstance(val, str) and val.strip().lower() in ("null", "none", "")):
                 return default
             return val
 
-        tm_cfg   = getattr(cfg.model, "timemix", None)
-        tm_out   = int(_get(tm_cfg, "out_channels", fused_in))
-        tm_drop  = float(_get(tm_cfg, "dropout", 0.0))
-        tm_act   = str(_get(tm_cfg, "activation", "elu")).lower()
+        # ----- WaveNet (TCN置換) -----
+        # cfg.model.wavenet（無ければ cfg.model.tcn）から取得
+        wn_cfg = getattr(cfg.model, "wavenet", None) or getattr(cfg.model, "tcn", None)
+        wn_k       = int(getattr(wn_cfg, "kernel_size", 3))            if wn_cfg is not None else 3
+        wn_layers  = int(getattr(wn_cfg, "n_layers", 6))               if wn_cfg is not None else 6
+        wn_stacks  = int(getattr(wn_cfg, "n_stacks", 2))               if wn_cfg is not None else 2
+        wn_base    = int(getattr(wn_cfg, "base_dilation", 1))          if wn_cfg is not None else 1
+        wn_drop    = float(getattr(wn_cfg, "dropout", 0.2))            if wn_cfg is not None else 0.2
+        wn_res_ch  = int(getattr(wn_cfg, "res_ch", 128))               if wn_cfg is not None else 128
+        wn_skip_ch = int(getattr(wn_cfg, "skip_ch", 256))              if wn_cfg is not None else 256
+        wn_out     = int(_get(wn_cfg, "out_channels",   per_step_feat))
+        wn_causal  = bool(getattr(wn_cfg, "causal", False))            if wn_cfg is not None else False
 
-        act_layer = nn.ELU if tm_act == "elu" else (nn.GELU if tm_act == "gelu" else nn.ReLU)
-        if tm_out == fused_in and tm_drop == 0.0 and tm_act == "elu":
-            # まったく同次元＆ドロップ無し＆標準actならIdentityでもOK
-            self.time_mixer = nn.Sequential(
-                nn.Linear(fused_in, tm_out, bias=False),
-                nn.ELU(inplace=True),
-            )
-        else:
-            self.time_mixer = nn.Sequential(
-                nn.Linear(fused_in, tm_out, bias=False),
-                act_layer(inplace=True) if tm_act != "gelu" else act_layer(),  # GELUはinplace不可
-                nn.Dropout(tm_drop),
-            )
-        self.tm_out = tm_out
+        self.wavenet = WaveNetStack_mask(
+            in_ch=per_step_feat, res_ch=wn_res_ch, skip_ch=wn_skip_ch, out_ch=wn_out,
+            k=wn_k, n_layers=wn_layers, n_stacks=wn_stacks,
+            base_dilation=wn_base, causal=wn_causal, drop=wn_drop
+        )
+        self.wn_out = wn_out
 
         # ----- Noise skip -----
-        self.noise = GaussianNoise(float(cfg.model.noise.std))
+        self.noise = GaussianNoise_mask(cfg.model.noise.std)
 
-        # ----- Attention Pooling & Head -----
-        self.attention_pooling = TimeAttention(self.tm_out + fused_in)
-        head_hidden = int(cfg.model.head.hidden)
+        # ----- Attention Pooling -----
+        attn_in_dim = self.wn_out + per_step_feat   # WaveNet出力 + 元特徴（ノイズスキップ）
+        self.attention_pooling = AttentionLayer_mask(attn_in_dim)
+
+        # ----- Head -----
+        head_hidden = cfg.model.head.hidden
         self.head_1 = nn.Sequential(
             nn.LazyLinear(head_hidden),
             nn.BatchNorm1d(head_hidden),
             nn.ReLU(),
-            nn.Dropout(float(cfg.model.head.dropout)),
+            nn.Dropout(cfg.model.head.dropout),
             nn.Linear(head_hidden, num_classes),
         )
 
@@ -871,65 +824,41 @@ class ModelVariant_WAVE_mask(nn.Module):  # ← クラス名は据え置き（�
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """
-        x: [B, T, C_total], lengths: [B], mask: [B, T] (True=有効)
+        x: [B, T, C]
+        lengths: [B]
+        mask: [B, T] (True=有効)  ※無ければ lengths から作成
         """
-        B, T, C_total = x.shape
-        device = x.device
+        B, T, C = x.shape
         if mask is None:
-            mask = (torch.arange(T, device=device)[None, :] < lengths[:, None])
+            mask = (torch.arange(T, device=x.device)[None, :] < lengths[:, None])
 
         # ----- Meta -----
         meta      = self.meta_extractor(x, mask)      # [B, 5*C]
         meta_proj = self.meta_dense(meta)             # [B, meta_dim]
 
-        # ----- Per-channel CNN（IMUとToFを分けて処理）-----
-        outs_imu, outs_tof = [], []
-        for i in range(C_total):
+        # ----- Per-channel CNN -----
+        outs = []
+        for i in range(C):
             ci = x[:, :, i].unsqueeze(1)             # [B,1,T]
             o  = self.branches[i](ci)                # [B, se_out, Tp]
-            o  = o.transpose(1, 2)                   # [B,Tp,se_out]
-            if i < self.imu_dim:
-                outs_imu.append(o)
-            else:
-                outs_tof.append(o)
+            outs.append(o.transpose(1, 2))           # -> [B,Tp,se_out]
+        combined = torch.cat(outs, dim=2)            # [B,Tp, per_step_feat]
+        Tp = combined.size(1)
 
-        Tp = outs_imu[0].size(1) if len(outs_imu) > 0 else outs_tof[0].size(1)
-        lengths_cnn = _down_len(lengths, self._cnn_pool_sizes)
-        mask_cnn = (torch.arange(Tp, device=device)[None, :] < lengths_cnn[:, None])  # True=有効
-        key_padding = ~mask_cnn  # MHA用（Trueが無効）
+        # ----- 長さ/マスク更新（MaxPool の分だけ短縮） -----
+        lengths_cnn = down_len(lengths, self._cnn_pool_sizes)  # [B]
+        mask_cnn = (torch.arange(Tp, device=lengths_cnn.device)[None, :] < lengths_cnn[:, None])  # [B,Tp]
 
-        # 連結
-        combined_imu = torch.cat(outs_imu, dim=2) if len(outs_imu) > 0 else None       # [B,Tp,se_out*imu_dim]
-        combined_tof = torch.cat(outs_tof, dim=2) if len(outs_tof) > 0 else None       # [B,Tp,se_out*tof_dim]
-        combined_all = torch.cat([t for t in [combined_imu, combined_tof] if t is not None], dim=2)
-
-        # ----- Co-Attention（必要なときだけ）-----
-        if self.use_coattn:
-            q_imu  = self.proj_q_imu(combined_imu)             # [B,Tp,D]
-            kv_tof = self.proj_kv_tof(combined_tof)            # [B,Tp,D]
-            ctx_imu, _ = self.attn_imu(q_imu, kv_tof, kv_tof, key_padding_mask=key_padding, need_weights=False)
-            ctx_imu = self.ln_imu(q_imu + ctx_imu)
-
-            q_tof  = self.proj_q_tof(combined_tof)
-            kv_imu = self.proj_kv_imu(combined_imu)
-            ctx_tof, _ = self.attn_tof(q_tof, kv_imu, kv_imu, key_padding_mask=key_padding, need_weights=False)
-            ctx_tof = self.ln_tof(q_tof + ctx_tof)
-
-            fused_seq = torch.cat([ctx_imu, ctx_tof], dim=2)   # [B,Tp, 2*D]
-        else:
-            fused_seq = combined_all                            # [B,Tp, per_step_all]
-
-        # ----- TimeMixer + Noise skip（WaveNet撤去）-----
-        mix_out  = self.time_mixer(fused_seq)                   # [B,Tp, tm_out]
-        noise_out= self.noise(fused_seq)                        # [B,Tp, fused_in]
-        seq_feat = torch.cat([mix_out, noise_out], dim=2)       # [B,Tp, tm_out + fused_in]
+        # ----- WaveNet + Noise skip -----
+        wn_out   = self.wavenet(combined)            # [B,Tp, wn_out]
+        noise_out= self.noise(combined)              # [B,Tp, per_step_feat]
+        seq_feat = torch.cat([wn_out, noise_out], dim=2)  # [B,Tp, wn_out + per_step_feat]
 
         # ----- AttnPool（pad無視） → Head -----
-        pooled = self.attention_pooling(seq_feat, mask=mask_cnn)  # [B, P]
-        fused  = torch.cat([pooled, meta_proj], dim=1)            # [B, P + meta_dim]
-        z_cls  = self.head_1(fused)                               # [B, num_classes]
+        pooled = self.attention_pooling(seq_feat, mask=mask_cnn)     # [B, P]
+        fused  = torch.cat([pooled, meta_proj], dim=1)                # [B, P + meta_dim]
+        z_cls  = self.head_1(fused)                                  # [B, num_classes]
         return z_cls
-
 
 
 class litmodel_mask(L.LightningModule):
@@ -952,7 +881,7 @@ class litmodel_mask(L.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["cfg"])
-        self.model = ModelVariant_WAVE_mask(cfg)
+        self.model = ModelVariant_WAVE_mask(cfg) 
 
         # metrics
         self.train_acc = MulticlassAccuracy(num_classes=num_classes, average="macro")
@@ -1082,5 +1011,3 @@ class litmodel_mask(L.LightningModule):
             "monitor": "val/loss",
         }
         return {"optimizer": opt, "lr_scheduler": sch}
-    
-   

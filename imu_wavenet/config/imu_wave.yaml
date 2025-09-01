@@ -29,26 +29,44 @@ train:
 
 model:
   model:
-    name: cnn_timemix_coattn
-    num_classes: null
-    num_channels: null       # 例: 48(IMU) + 5(ToF)
-
-  modalities:
-    imu_dim: null
-    tof_dim: null
-
-  cnn:
-    multiscale:
-      out_per_kernel: 12
-      kernel_sizes: [3, 5, 7]
-    se:
-      out_channels: 48
-      drop: 0.30
-    pool_sizes: [2, 2]
+    num_classes: 18
+    num_channels: 15
+    tcn:
+      kernel_size: 3
+      n_layers: 5
+      base_dilation: 1
+      dropout: 0.2
+      out_channels: null   # 省略/None なら per_step_feat と同じ
+  wavenet:
+    kernel_size: 3
+    n_layers: 6
+    n_stacks: 2
+    base_dilation: 1
+    dropout: 0.2
+    res_ch: 128
+    skip_ch: 256
+    out_channels: null   # 未設定/Noneなら per_step_feat と同じ
+    causal: false        # オフライン分類なら false 推奨
 
   meta:
     proj_dim: 32
     dropout: 0.20
+
+  cnn:
+    multiscale:
+      out_per_kernel: 12        # 12 × len([3,5,7]) = 36ch をコード側で算出
+      kernel_sizes: [3, 5, 7]
+    se:
+      out_channels: 48          # 各チャンネル枝の最終出力チャネル
+      drop: 0.30
+      
+    pool_sizes: [2, 2]        # MaxPool1d を2回通す想定 → L_out ≈ floor(L/4)
+
+  rnn:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.20
+    bidirectional: true
 
   noise:
     std: 0.09
@@ -56,19 +74,6 @@ model:
   head:
     hidden: 512
     dropout: 0.50
-
-  timemix:
-    out_channels: null     # → 自動で入力次元に合わせる
-    dropout: 0.10
-    activation: gelu
-
-  # ★ 新設: Co-Attention（IMU⇄ToF）
-  coattn:
-    dim: 256               # 内部埋め込み
-    num_heads: 4
-    dropout: 0.10
-
-
 
 aug:
   no_aug: false

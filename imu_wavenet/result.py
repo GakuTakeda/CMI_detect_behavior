@@ -3,7 +3,7 @@ from optuna.trial import TrialState
 import pandas as pd
 import os
 
-STUDY_NAME = "imu_tuning_3"
+STUDY_NAME = "imu_tuning"
 STORAGE = "sqlite:///lstmgru_tuning.db"  # ここは絶対パスにしておくと安全
 
 # 既存のスタディをロード
