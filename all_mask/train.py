@@ -17,6 +17,7 @@ def run(cfg: DictConfig):
     seed_everything(cfg.data.random_seed)
     n_splits = cfg.data.n_splits        # 例: 5
     avg = []
+    submission, solution = [], []
     for fold in range(n_splits):
         print(f"\n===== Fold {fold} / {n_splits-1} =====")
 
@@ -79,7 +80,6 @@ def run(cfg: DictConfig):
             )
             model.eval().to(device)
 
-            submission, solution = [], []
             for batch in dm.val_dataloader_imu():
                 # 検証は通常 (x, lengths, mask, y)。万一 train 用 collate が来ても耐性を持たせる
                 if len(batch) == 4:
@@ -100,30 +100,19 @@ def run(cfg: DictConfig):
                 submission.extend([gesture_classes[i] for i in pred_ids])
                 solution.extend([gesture_classes[i] for i in true_ids])
 
-            if cfg.train.mode == "8_class":
-               scores = {
-                    f"macro_score_of_fold_{fold+1}_mask":   caluculate.macro_score(solution, submission),
-                }     
-            else:        
-                scores = {
-                    f"binary_score_of_fold_{fold+1}_mask":  caluculate.binary_score(solution, submission),
-                    f"macro_score_of_fold_{fold+1}_mask":   caluculate.macro_score(solution, submission),
-                }
 
-            print("Fold scores:", scores)
-            if cfg.train.mode == "8_class":
-               avg.append(scores[f"macro_score_of_fold_{fold+1}_mask"])
-            else:
-                avg.append(scores[f"binary_score_of_fold_{fold+1}_mask"] + scores[f"macro_score_of_fold_{fold+1}_mask"])
-
-            with open(dm.export_dir / f"scores_{fold+1}.json", "w") as f:
-                json.dump(scores, f, indent=2, ensure_ascii=False)
+        del model, trainer
+        if fold != n_splits - 1:
+            del dm
+        torch.cuda.empty_cache()
 
     with open(os.path.join(dm.export_dir, "config_resolved.yaml"), "w", encoding="utf-8") as f:
         f.write(OmegaConf.to_yaml(cfg))
-    print("Average scores across folds:", np.mean(avg))
-    with open(dm.export_dir / "avg_scores.json", "w", encoding="utf-8") as f:
-        json.dump({"average_score": np.mean(avg)}, f, indent=2, ensure_ascii=False)
+    scores = {
+        f"binary_score_of_fold_mask":  caluculate.binary_score(solution, submission),
+        f"macro_score_of_fold_mask":   caluculate.macro_score(solution, submission),
+    }
+    print("Scores:", scores)
 
 if __name__ == "__main__":
     run()

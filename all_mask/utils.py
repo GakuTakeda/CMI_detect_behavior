@@ -288,7 +288,29 @@ def calculate_angular_distance(rot_data):
     return angular_dist
 
 
-def feature_eng(df: pd.DataFrame) -> pd.DataFrame:
+def feature_eng(
+    df: pd.DataFrame,
+    *,
+    rot_fillna: bool = False,
+    add_linear_acc: bool = True,
+    add_energy_feats: bool = True,
+    tof_mode: int = 1,
+    tof_region_stats: tuple[str, ...] = ("mean", "std", "min", "max"),
+    tof_sensor_ids: tuple[int, ...] = (1, 2, 3, 4, 5),
+) -> pd.DataFrame:
+    """
+    CMIFeDataset の命名/仕様に揃えた特徴量生成。
+    - IMU派生: acc_mag/rot_angle/jerk系, 角速度, 角距離(=angular_distance)
+    - 直線加速度: remove_gravity_from_acc による linear_acc_x/y/z (+ magnitude/jerk)
+    - ToF: sensorごとの mean/std/min/max と、必要なら 1D分割リージョン統計
+           (tof_mode>1 → 'tof{mode}_{i}_region_{r}_{stat}', tof_mode==-1 → {2,4,8,16,32})
+    - 列順: 最初の thm_/tof_ カラムの直前に IMU派生を挿入（既存 DataModule と互換）
+    """
+    # --- IMU 基本 ---
+    if rot_fillna:
+        df['rot_w'] = df['rot_w'].fillna(1)
+        df[['rot_x', 'rot_y', 'rot_z']] = df[['rot_x', 'rot_y', 'rot_z']].fillna(0)
+
     df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
     df['rot_angle'] = 2 * np.arccos(df['rot_w'].clip(-1, 1))
     df['acc_mag_jerk'] = df.groupby('sequence_id')['acc_mag'].diff().fillna(0)
@@ -678,8 +700,11 @@ class EnhancedResidualSEBlock_mask(nn.Module):
         self.conv2 = nn.Conv1d(out_ch, out_ch, k, padding=pad, bias=False)
         self.bn2   = nn.BatchNorm1d(out_ch)
 
-        self.shortcut = nn.Conv1d(in_ch, out_ch, 1, bias=False) if in_ch != out_ch else nn.Identity()
-        self.bn_sc = nn.BatchNorm1d(out_ch) if in_ch != out_ch else nn.Identity()
+    def _post_pool_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        ps_imu = self._imu_pool_sizes
+        ps_tof = self._tof_pool_sizes
+        pool_seq = ps_imu if len(ps_imu) >= len(ps_tof) else ps_tof
+        return _down_len(lengths, pool_seq)
 
         self.se     = EnhancedSEBlock_mask(out_ch)
         self.pool   = nn.MaxPool1d(pool_size)  # stride=pool_size
@@ -737,12 +762,29 @@ class MetaFeatureExtractor_mask(nn.Module):
         else:
             valid = mask
 
-        # [B,T,1] に拡張
-        m = valid.unsqueeze(-1)  # True=有効
-        cnt = m.sum(dim=1).clamp_min(1)  # [B,1]
+        # ---- RNN（pack/pad）----
+        packed = nn.utils.rnn.pack_padded_sequence(merged, lengths_cnn.cpu(),
+                                                   batch_first=True, enforce_sorted=False)
+        rnn_p, _  = self.rnn(packed)
+        rnn_out, _  = nn.utils.rnn.pad_packed_sequence(rnn_p,  batch_first=True, total_length=Tp)  # [B,Tp,rnn_out_dim]
 
-        xm = x * m  # 無効部は0
+        # ---- TCN（pack不要）----
+        tcn_out = self.tcn(merged)                 # [B,Tp,tcn_out]
 
+        # ---- Noise + TD（最後にconcatする相方）----
+        noisy   = self.noise(merged)               # [B,Tp,F]
+        td_feat = self.timed_act(self.timed_fc(noisy))  # [B,Tp,16]
+
+        # ---- 最後に concat（RNN/TCN/TD）----
+        seq_cat = torch.cat([rnn_out, tcn_out, td_feat], dim=2)  # [B,Tp, rnn_out_dim + tcn_out + 16]
+        pooled  = self.attn(seq_cat, mask=mask_cnn)              # [B,D_att]
+
+        # ---- meta（全特徴: mean/std/min/max/abs-mean）----
+        with torch.no_grad():
+            valid = mask if mask is not None else torch.ones(B, T, dtype=torch.bool, device=device)
+        m   = valid.unsqueeze(-1)
+        cnt = m.sum(dim=1).clamp_min(1)
+        xm  = x * m
         mean = xm.sum(dim=1) / cnt
         var = ( (xm - mean.unsqueeze(1)) * m ).pow(2).sum(dim=1) / cnt
         std = torch.sqrt(var + self.eps)
@@ -929,6 +971,7 @@ class ModelVariant_WAVE_mask(nn.Module):  # ← クラス名は据え置き（�
         fused  = torch.cat([pooled, meta_proj], dim=1)            # [B, P + meta_dim]
         z_cls  = self.head_1(fused)                               # [B, num_classes]
         return z_cls
+
 
 
 

@@ -29,13 +29,17 @@ train:
 
 model:
   model:
-    name: cnn_timemix_coattn
-    num_classes: null
-    num_channels: null       # 例: 48(IMU) + 5(ToF)
+    name: lstmgru_tcn_concat
+    num_classes: 18
+    num_channels: 360          # = imu_dim + tof_dim （要一致）
 
   modalities:
-    imu_dim: null
-    tof_dim: null
+    imu_dim: 15
+    tof_dim: 345
+
+  meta:
+    proj_dim: 32
+    dropout: 0.2
 
   cnn:
     multiscale:
@@ -43,19 +47,41 @@ model:
       kernel_sizes: [3, 5, 7]
     se:
       out_channels: 48
-      drop: 0.30
+      drop: 0.3
     pool_sizes: [2, 2]
 
-  meta:
-    proj_dim: 32
-    dropout: 0.20
+  branches:
+    imu:
+      filters:  [64, 128]
+      kernels:  [3, 5]
+      dropouts: [0.1, 0.1]
+    tof:
+      filters:  [64, 128]
+      kernels:  [3, 3]
+      dropouts: [0.2, 0.2]
+
+  # ← 追加: 片方だけ使うRNNの種類（'gru' or 'lstm'）
+  rnn:
+    type: gru               # "gru" | "lstm"
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.2
+    bidirectional: true
+
+  # ← 追加: TCNスタック（RNNと並列で使い、最後にconcat）
+  tcn:
+    kernel_size: 3
+    n_layers: 5
+    base_dilation: 1
+    dropout: 0.2
+    out_channels: null      # null→CNN出力と同次元で軽量
 
   noise:
     std: 0.09
 
   head:
     hidden: 512
-    dropout: 0.50
+    dropout: 0.5
 
   timemix:
     out_channels: null     # → 自動で入力次元に合わせる
@@ -72,25 +98,25 @@ model:
 
 aug:
   no_aug: false
-  p_time_shift: 0.5
-  max_shift_ratio: 0.2
+  p_time_shift: 0.75
+  max_shift_ratio: 0.21
   p_time_warp: 0.0
-  warp_min: 0.9
-  warp_max: 1.1
-  p_block_dropout: 0.0
+  warp_min: 0.90
+  warp_max: 1.10
+  p_block_dropout: 0.16
   n_blocks:
-  - 1
   - 2
-  block_len:
   - 2
+  block_len: 
   - 5
-  p_imu_jitter: 0.0
-  imu_sigma: 0.0
-  p_imu_scale: 0.0
-  imu_scale_sigma: 0.0
-  p_imu_drift: 0.0
-  drift_std: 0.003
-  drift_clip: 0.25
-  p_imu_small_rot: 0.0
-  rot_deg: 5.0
+  - 7
+  p_imu_jitter: 0.26
+  imu_sigma: 0.02
+  p_imu_scale: 0.35
+  imu_scale_sigma: 0.08
+  p_imu_drift: 0.19
+  drift_std: 0.001
+  drift_clip: 0.43
+  p_imu_small_rot: 0.33
+  rot_deg: 5.5
   pad_value: 0.0
