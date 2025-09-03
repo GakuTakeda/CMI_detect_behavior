@@ -292,8 +292,8 @@ def feature_eng(
     df: pd.DataFrame,
     *,
     rot_fillna: bool = False,
-    add_linear_acc: bool = False,
-    add_energy_feats: bool = False,
+    add_linear_acc: bool = True,
+    add_energy_feats: bool = True,
     tof_mode: int = 1,
     tof_region_stats: tuple[str, ...] = ("mean", "std", "min", "max"),
     tof_sensor_ids: tuple[int, ...] = (1, 2, 3, 4, 5),
@@ -777,8 +777,100 @@ class TimeAttention(nn.Module):
         ctx = torch.bmm(w.unsqueeze(1), x).squeeze(1) # [B,D]
         return ctx
 
-# ---------- main model (cfg-driven) ----------
+class EnhancedSEBlock_mask(nn.Module):
+    """Avg/Maxの両方でSE"""
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels * 2, channels // reduction, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        avg_y = self.avg_pool(x).view(b, c)
+        max_y = self.max_pool(x).view(b, c)
+        y = torch.cat([avg_y, max_y], dim=1)
+        y = self.excitation(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
+class TCNResidualBlock_mask(nn.Module):
+    """
+    Depthwise(膨張)Conv1d → PointwiseConv1d を2回 + 残差 + SE + GELU
+    入出力長は保持（SAME相当）。
+    入出力形状: [B,T,Cin] -> [B,T,Cout]
+    """
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, dilation: int = 1, drop: float = 0.2, use_se: bool = True):
+        super().__init__()
+        pad = dilation * (k - 1) // 2
+
+        # Block A
+        self.dw1 = nn.Conv1d(in_ch, in_ch, kernel_size=k, padding=pad, dilation=dilation,
+                             groups=in_ch, bias=False)
+        self.pw1 = nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+
+        # Block B
+        self.dw2 = nn.Conv1d(out_ch, out_ch, kernel_size=k, padding=pad, dilation=dilation,
+                             groups=out_ch, bias=False)
+        self.pw2 = nn.Conv1d(out_ch, out_ch, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+
+        # residual
+        self.short = nn.Identity() if in_ch == out_ch else nn.Conv1d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.bn_sc  = nn.Identity() if in_ch == out_ch else nn.BatchNorm1d(out_ch)
+
+        self.se   = EnhancedSEBlock_mask(out_ch) if use_se else nn.Identity()
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x_btC: torch.Tensor) -> torch.Tensor:        # x: [B,T,C]
+        x = x_btC.transpose(1, 2)                                   # -> [B,C,T]
+        sc = self.bn_sc(self.short(x))
+
+        y = self.dw1(x); y = self.pw1(y); y = self.bn1(y); y = F.gelu(y)
+        y = self.dw2(y); y = self.pw2(y); y = self.bn2(y)
+        y = self.se(y)
+        y = F.gelu(y + sc)
+        y = self.drop(y)
+        return y.transpose(1, 2)                                    # -> [B,T,Cout]
+
+
+class TCNStack_mask(nn.Module):
+    """
+    dilation を [base, base*2, base*4, ...] と増やすスタック。
+    すべて長さ保存。入出力は [B,T,C]。
+    """
+    def __init__(self, ch: int, k: int = 3, n_layers: int = 5, base_dilation: int = 1,
+                 drop: float = 0.2, use_se: bool = True, out_ch: Optional[int] = None):
+        super().__init__()
+        layers = []
+        in_ch = ch
+        for i in range(n_layers):
+            d = base_dilation * (2 ** i)
+            layers.append(TCNResidualBlock_mask(in_ch, ch, k=k, dilation=d, drop=drop, use_se=use_se))
+            in_ch = ch
+        self.blocks = nn.Sequential(*layers)
+
+        # 出力次元の調整（必要なときだけ）
+        self.to_out = nn.Identity() if (out_ch is None or out_ch == ch) else nn.Sequential(
+            nn.Linear(ch, out_ch, bias=False),
+            nn.LayerNorm(out_ch),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:             # [B,T,C]
+        y = self.blocks(x)
+        return y if isinstance(self.to_out, nn.Identity) else self.to_out(y)
+
 class TwoBranch_mask(nn.Module):
+    """
+    Per-branch CNN → {RNN(片方のみ) + TCN} → Noise(Time-Distributed) → concat → AttnPool → Head
+    可変長+mask対応：RNNはpack/pad、TCNはそのまま、Attnでmaskを無視
+    """
     def __init__(self, cfg: DictConfig):
         super().__init__()
         mcfg = cfg.model
@@ -793,14 +885,13 @@ class TwoBranch_mask(nn.Module):
         self.num_classes = int(mcfg.model.num_classes)
 
         # ---- branches config ----
-        ps = mcfg.cnn.pool_sizes             # 例: [2,2]
+        ps = mcfg.cnn.pool_sizes
         imu_filters  = mcfg.branches.imu.filters
         imu_kernels  = mcfg.branches.imu.kernels
         imu_drops    = mcfg.branches.imu.dropouts
         tof_filters  = mcfg.branches.tof.filters
         tof_kernels  = mcfg.branches.tof.kernels
         tof_drops    = mcfg.branches.tof.dropouts
-        # パディング→長さ更新で使う pool_sizes を各ブロック回数に合わせて展開
         self._imu_pool_sizes = ps[:len(imu_filters)] + [ps[-1]] * max(0, len(imu_filters)-len(ps))
         self._tof_pool_sizes = ps[:len(tof_filters)] + [ps[-1]] * max(0, len(tof_filters)-len(ps))
 
@@ -810,8 +901,6 @@ class TwoBranch_mask(nn.Module):
             blocks = []
             in_ch = imu_dim
             for f, k, d, p in zip(imu_filters, imu_kernels, imu_drops, self._imu_pool_sizes):
-                print(imu_kernels)
-                print(k)
                 blocks.append(ResidualSEConv1D(in_ch, f, k, pool=p, drop=d))
                 in_ch = f
             self.imu_blocks = nn.Sequential(*blocks)
@@ -832,38 +921,63 @@ class TwoBranch_mask(nn.Module):
         else:
             tof_out_ch = 0
 
-        merged_feat = int(imu_out_ch + tof_out_ch)
+        merged_feat = int(imu_out_ch + tof_out_ch)   # CNN後の時刻特徴次元
 
-        # ---- RNNs ----
+        # ---- 片方だけRNN（GRU or LSTM）----
         rcfg = mcfg.rnn
-        self.bigru = nn.GRU(
-            input_size=merged_feat,
-            hidden_size=int(rcfg.hidden_size),
-            num_layers=int(rcfg.num_layers),
-            dropout=float(rcfg.dropout) if int(rcfg.num_layers) > 1 else 0.0,
-            bidirectional=bool(rcfg.bidirectional),
-            batch_first=True,
-        )
-        self.bilstm = nn.LSTM(
-            input_size=merged_feat,
-            hidden_size=int(rcfg.hidden_size),
-            num_layers=int(rcfg.num_layers),
-            dropout=float(rcfg.dropout) if int(rcfg.num_layers) > 1 else 0.0,
-            bidirectional=bool(rcfg.bidirectional),
-            batch_first=True,
-        )
+        rnn_type = str(getattr(rcfg, "type", "gru")).lower()  # "gru" | "lstm"
         bi = 2 if bool(rcfg.bidirectional) else 1
+        if rnn_type == "lstm":
+            self.rnn = nn.LSTM(
+                input_size=merged_feat,
+                hidden_size=int(rcfg.hidden_size),
+                num_layers=int(rcfg.num_layers),
+                dropout=float(rcfg.dropout) if int(rcfg.num_layers) > 1 else 0.0,
+                bidirectional=bool(rcfg.bidirectional),
+                batch_first=True,
+            )
+        else:
+            self.rnn = nn.GRU(
+                input_size=merged_feat,
+                hidden_size=int(rcfg.hidden_size),
+                num_layers=int(rcfg.num_layers),
+                dropout=float(rcfg.dropout) if int(rcfg.num_layers) > 1 else 0.0,
+                bidirectional=bool(rcfg.bidirectional),
+                batch_first=True,
+            )
+        rnn_out_dim = int(rcfg.hidden_size) * bi
 
-        # ---- time-distributed dense + noise ----
-        self.noise = GaussianNoise(float(mcfg.noise.std))
+        # ---- TCN（RNNの相方）----
+        def _get(cfgobj, key, default):
+            if cfgobj is None:
+                return default
+            v = getattr(cfgobj, key, default)
+            if v is None or (isinstance(v, str) and v.strip().lower() in ("", "none", "null")):
+                return default
+            return v
+
+        tcfg      = getattr(mcfg, "tcn", None)
+        tcn_k     = int(_get(tcfg, "kernel_size",   3))
+        tcn_layers= int(_get(tcfg, "n_layers",      5))
+        tcn_base  = int(_get(tcfg, "base_dilation", 1))
+        tcn_drop  = float(_get(tcfg, "dropout",     0.2))
+        tcn_out   = int(_get(tcfg, "out_channels",  merged_feat))  # 省略/None→ CNN出力と同次元
+        self.tcn  = TCNStack_mask(
+            ch=merged_feat, k=tcn_k, n_layers=tcn_layers,
+            base_dilation=tcn_base, drop=tcn_drop, use_se=True, out_ch=tcn_out
+        )
+        self.tcn_out = tcn_out
+
+        # ---- noise + time-distributed ----
+        self.noise     = GaussianNoise(float(mcfg.noise.std))
         self.timed_fc  = nn.Linear(merged_feat, 16)
         self.timed_act = nn.ELU(inplace=True)
 
-        att_in = int(rcfg.hidden_size)*bi + int(rcfg.hidden_size)*bi + 16
+        # 最後に concat: [RNN_out || TCN_out || TD(noise)]
+        att_in = rnn_out_dim + self.tcn_out + 16
         self.attn = TimeAttention(att_in)
 
         # ---- meta features（全特徴）----
-        self.use_meta = True
         meta_dim = int(mcfg.meta.proj_dim)
         self.meta_dropout = float(mcfg.meta.dropout)
         self.meta_proj = nn.Sequential(
@@ -893,11 +1007,8 @@ class TwoBranch_mask(nn.Module):
         return x.transpose(1, 2).contiguous()
 
     def _post_pool_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
-        # 各ブランチで pool してから結合するので、長さは同じ回数だけ縮む前提（構成を合わせている）
-        # IMU/ToF でブロック数が違う場合は、より短い方に合わせるのが安全 → ここでは「両者のpool適用回数の最大」を採用
         ps_imu = self._imu_pool_sizes
         ps_tof = self._tof_pool_sizes
-        # 長さ更新は「両方のpool列のうち長い方」に合わせる（=多く縮む想定）
         pool_seq = ps_imu if len(ps_imu) >= len(ps_tof) else ps_tof
         return _down_len(lengths, pool_seq)
 
@@ -933,29 +1044,29 @@ class TwoBranch_mask(nn.Module):
             mask = (torch.arange(T, device=device)[None, :] < lengths[:, None])
         mask_cnn = (torch.arange(Tp, device=device)[None, :] < lengths_cnn[:, None])
 
-        # RNNs (pack/pad)
+        # ---- RNN（pack/pad）----
         packed = nn.utils.rnn.pack_padded_sequence(merged, lengths_cnn.cpu(),
                                                    batch_first=True, enforce_sorted=False)
-        gru_p, _  = self.bigru(packed)
-        lstm_p,_  = self.bilstm(packed)
-        gru_out, _  = nn.utils.rnn.pad_packed_sequence(gru_p,  batch_first=True, total_length=Tp)
-        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_p, batch_first=True, total_length=Tp)
+        rnn_p, _  = self.rnn(packed)
+        rnn_out, _  = nn.utils.rnn.pad_packed_sequence(rnn_p,  batch_first=True, total_length=Tp)  # [B,Tp,rnn_out_dim]
 
-        noisy   = self.noise(merged)
-        td_feat = self.timed_act(self.timed_fc(noisy))
+        # ---- TCN（pack不要）----
+        tcn_out = self.tcn(merged)                 # [B,Tp,tcn_out]
 
-        rnn_cat = torch.cat([gru_out, lstm_out, td_feat], dim=2)  # [B,T',D]
-        pooled  = self.attn(rnn_cat, mask=mask_cnn)               # [B,D_att]
+        # ---- Noise + TD（最後にconcatする相方）----
+        noisy   = self.noise(merged)               # [B,Tp,F]
+        td_feat = self.timed_act(self.timed_fc(noisy))  # [B,Tp,16]
 
-        # meta（全特徴で mean/std/min/max/abs-mean の5*C）
+        # ---- 最後に concat（RNN/TCN/TD）----
+        seq_cat = torch.cat([rnn_out, tcn_out, td_feat], dim=2)  # [B,Tp, rnn_out_dim + tcn_out + 16]
+        pooled  = self.attn(seq_cat, mask=mask_cnn)              # [B,D_att]
+
+        # ---- meta（全特徴: mean/std/min/max/abs-mean）----
         with torch.no_grad():
-            if mask is None:
-                valid = torch.ones(B, T, dtype=torch.bool, device=device)
-            else:
-                valid = mask
-        m = valid.unsqueeze(-1)
+            valid = mask if mask is not None else torch.ones(B, T, dtype=torch.bool, device=device)
+        m   = valid.unsqueeze(-1)
         cnt = m.sum(dim=1).clamp_min(1)
-        xm = x * m
+        xm  = x * m
         mean = xm.sum(dim=1) / cnt
         var  = ((xm - mean.unsqueeze(1)) * m).pow(2).sum(dim=1) / cnt
         std  = torch.sqrt(var + 1e-6)
@@ -969,6 +1080,7 @@ class TwoBranch_mask(nn.Module):
 
         logits = self.head(fused)
         return logits
+
 
 
 class litmodel_mask(L.LightningModule):

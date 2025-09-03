@@ -2,7 +2,7 @@
 import numpy as np, pandas as pd, torch, joblib, pathlib
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, GroupKFold
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
 from utils import (preprocess_sequence, SequenceDatasetVarLen, 
@@ -133,12 +133,12 @@ class GestureDataModule(L.LightningDataModule):
         y_int = np.array(y_int)
 
         # ---- StratifiedKFold（元実装に合わせる）----
-        skf = StratifiedKFold(
+        skf = StratifiedGroupKFold(
             n_splits=self.n_splits,
             shuffle=True,
-            random_state=self.cfg.data.random_seed
+            random_state=0
         )
-        tr_idx, val_idx = list(skf.split(X=np.arange(len(X_list)), y=y_int))[self.fold_idx]
+        tr_idx, val_idx = list(skf.split(X=np.arange(len(X_list)), y=y_int, groups=subjects))[self.fold_idx]
 
         # ---- Augmenter（マルチモーダル）----
         if self.cfg.aug.no_aug:
